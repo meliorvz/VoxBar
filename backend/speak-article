@@ -1,0 +1,9 @@
+#!/bin/zsh
+set -euo pipefail
+cd "$(dirname "$0")"
+if [[ ! -x ./.venv/bin/python ]]; then
+  echo "Missing .venv. Run ./setup.sh first." >&2
+  exit 1
+fi
+
+./.venv/bin/python article_tts.py "$@"

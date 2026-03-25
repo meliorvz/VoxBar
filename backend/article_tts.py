@@ -1,0 +1,1165 @@
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.*")
+import requests
+import soundfile as sf
+import trafilatura
+from bs4 import BeautifulSoup
+from kokoro_onnx import Kokoro
+from readability import Document
+
+PROJECT_DIR = Path(__file__).resolve().parent
+MODELS_DIR = PROJECT_DIR / "models"
+OUTPUT_DIR = PROJECT_DIR / "output"
+JOBS_DIR = OUTPUT_DIR / "jobs"
+PREVIEWS_DIR = OUTPUT_DIR / "previews"
+MODEL_PATH = MODELS_DIR / "kokoro-v1.0.int8.onnx"
+VOICES_PATH = MODELS_DIR / "voices-v1.0.bin"
+DEFAULT_VOICE = "af_alloy"
+DEFAULT_LANG = "auto"
+DEFAULT_MANDARIN_VOICE = "zf_xiaobei"
+DEFAULT_PREVIEW_TEXT = "The quick brown fox jumps over the lazy dog."
+DEFAULT_METADATA_BASE_URL = os.getenv("ARTICLE_TTS_METADATA_BASE_URL", "http://127.0.0.1:1234")
+DEFAULT_METADATA_MODEL = os.getenv(
+    "ARTICLE_TTS_METADATA_MODEL",
+    "qwen3.5-2b",
+)
+DEFAULT_METADATA_IDENTIFIER = os.getenv("ARTICLE_TTS_METADATA_IDENTIFIER", "articletts-2b")
+DEFAULT_METADATA_CONTEXT = 4096
+DEFAULT_METADATA_TTL = 90
+DEFAULT_LMS_BIN = os.getenv("ARTICLE_TTS_LMS_BIN", "lms")
+DEFAULT_METADATA_TIMEOUT = 30.0
+METADATA_SYSTEM_PROMPT = """You create short descriptive metadata for articles and pasted text.
+
+Return only JSON matching the provided schema.
+
+Rules:
+- Capture the main topic precisely.
+- Use 2 to 6 words for summary_name when possible.
+- Keep summary under 20 words.
+- Prefer specificity over generic labels.
+- Do not invent facts not present in the text.
+- Keep tags short and topical.
+- Do not include quotes, emojis, dates, or trailing punctuation in summary_name.
+- Do not end summary_name with dangling words or incomplete phrases.
+"""
+METADATA_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary_name": {"type": "string"},
+        "summary": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary_name", "summary", "tags"],
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch an article URL or accept raw text, synthesize speech, and play it."
+    )
+    parser.add_argument("source", nargs="?", help="Article URL or raw text")
+    parser.add_argument("--text", help="Raw text to synthesize directly")
+    parser.add_argument("--text-file", type=Path, help="Path to a text file to synthesize")
+    parser.add_argument("--stdin", action="store_true", help="Read raw text from stdin")
+    parser.add_argument("--title", help="Optional title used for output filenames")
+    parser.add_argument("--voice", default=DEFAULT_VOICE, help=f"Kokoro voice name. Default: {DEFAULT_VOICE}")
+    parser.add_argument(
+        "--lang",
+        default=DEFAULT_LANG,
+        help=f"Kokoro language code. Use 'auto', 'en-us', or 'cmn'. Default: {DEFAULT_LANG}",
+    )
+    parser.add_argument("--speed", type=float, default=1.0, help="Speech speed multiplier")
+    parser.add_argument("--metadata-only", action="store_true", help="Generate title metadata JSON and exit")
+    parser.add_argument("--no-metadata", action="store_true", help="Skip local title/metadata generation")
+    parser.add_argument("--lms-bin", default=DEFAULT_LMS_BIN, help=f"Path to LM Studio CLI. Default: {DEFAULT_LMS_BIN}")
+    parser.add_argument(
+        "--metadata-base-url",
+        default=DEFAULT_METADATA_BASE_URL,
+        help=f"Local metadata endpoint base URL. Default: {DEFAULT_METADATA_BASE_URL}",
+    )
+    parser.add_argument(
+        "--metadata-model",
+        default=DEFAULT_METADATA_MODEL,
+        help=f"Local metadata model name. Default: {DEFAULT_METADATA_MODEL}",
+    )
+    parser.add_argument(
+        "--metadata-identifier",
+        default=DEFAULT_METADATA_IDENTIFIER,
+        help=f"Loaded-model identifier used for metadata requests. Default: {DEFAULT_METADATA_IDENTIFIER}",
+    )
+    parser.add_argument(
+        "--metadata-context-length",
+        type=int,
+        default=DEFAULT_METADATA_CONTEXT,
+        help=f"Context length used when loading the metadata model. Default: {DEFAULT_METADATA_CONTEXT}",
+    )
+    parser.add_argument(
+        "--metadata-ttl",
+        type=int,
+        default=DEFAULT_METADATA_TTL,
+        help=f"Safety TTL in seconds for metadata model loads. Default: {DEFAULT_METADATA_TTL}",
+    )
+    parser.add_argument(
+        "--metadata-timeout",
+        type=float,
+        default=DEFAULT_METADATA_TIMEOUT,
+        help=f"Metadata request timeout in seconds. Default: {DEFAULT_METADATA_TIMEOUT}",
+    )
+    parser.add_argument("--list-voices", action="store_true", help="Print available Kokoro voices and exit")
+    parser.add_argument("--list-voices-json", action="store_true", help="Print available voices as JSON and exit")
+    parser.add_argument("--json-events", action="store_true", help="Emit machine-readable NDJSON events")
+    parser.add_argument("--json-progress", action="store_true", help="Deprecated alias for --json-events")
+    parser.add_argument("--job-id", help="Stable job id used for output/jobs/<job-id>")
+    parser.add_argument(
+        "--preview-all-voices",
+        action="store_true",
+        help="Generate one combined wav preview for every Kokoro voice",
+    )
+    parser.add_argument(
+        "--preview-text",
+        default=DEFAULT_PREVIEW_TEXT,
+        help=f"Phrase used for --preview-all-voices. Default: {DEFAULT_PREVIEW_TEXT}",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUTPUT_DIR,
+        help=f"Directory for extracted text and wav output. Default: {OUTPUT_DIR}",
+    )
+    parser.add_argument("--no-play", action="store_true", help="Generate files but do not play audio")
+    return parser.parse_args()
+
+
+def require_models() -> None:
+    missing = [path.name for path in (MODEL_PATH, VOICES_PATH) if not path.exists()]
+    if missing:
+        names = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Missing Kokoro model files: {names}. Put them in {MODELS_DIR}"
+        )
+
+
+def build_kokoro() -> Kokoro:
+    require_models()
+    return Kokoro(str(MODEL_PATH), str(VOICES_PATH))
+
+
+def fetch_html(url: str) -> str:
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def strip_markdown_for_tts(text: str) -> str:
+    cleaned = text
+    cleaned = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|>~])", r"\1", cleaned)
+    cleaned = re.sub(r"```[\w-]*\n.*?```", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", cleaned)
+    cleaned = re.sub(r"(?m)^\s*\[\^?[^\]]+\]:\s*.*$", "", cleaned)
+    cleaned = re.sub(r"(?<!\w)\[\^?[A-Za-z0-9_-]+\]", "", cleaned)
+    cleaned = re.sub(r"(?<=\w)\[\^?[A-Za-z0-9_-]+\]", "", cleaned)
+    cleaned = re.sub(r"<https?://[^>]+>", "", cleaned)
+    cleaned = re.sub(r"https?://\S+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s{0,3}>\s?", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-+*]\s+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*\d+[.)]\s+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*\[[ xX]\]\s+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*(?:[-*_]\s*){3,}$", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$", "", cleaned)
+    cleaned = re.sub(r"(?<!\w)\*\*\*([^*\n]+)\*\*\*(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)\*\*([^*\n]+)\*\*(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)___([^_\n]+)___(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)__([^_\n]+)__(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"~~([^~\n]+)~~", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`\n]+)`", r"\1", cleaned)
+    normalized_lines: list[str] = []
+    for line in cleaned.splitlines():
+        if line.count("|") >= 2:
+            stripped = line.strip()
+            if stripped.startswith("|") or stripped.endswith("|"):
+                line = line.replace("|", " ")
+        normalized_lines.append(line)
+    cleaned = "\n".join(normalized_lines)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
+def clean_text(text: str) -> str:
+    text = strip_markdown_for_tts(text)
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        if len(line) == 1:
+            continue
+        lines.append(line)
+
+    text = "\n\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def derive_title_from_text(text: str) -> str:
+    for line in text.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip(" -#\t")
+        if len(cleaned) >= 3:
+            return cleaned[:80]
+    return "pasted-text"
+
+
+def preview_prompt_for_voice(voice: str, phrase: str) -> str:
+    spoken_name = voice.replace("_", " ")
+    normalized_phrase = phrase.strip()
+    if normalized_phrase and normalized_phrase[-1] not in ".!?":
+        normalized_phrase += "."
+    return f"This is {spoken_name}. {normalized_phrase}"
+
+
+def clamp_speed(speed: float) -> float:
+    return max(0.5, min(1.5, speed))
+
+
+def sanitize_summary_name(text: str) -> str:
+    cleaned = text.strip().strip("\"'`")
+    cleaned = re.sub(r"[\r\n]+", " ", cleaned)
+    cleaned = re.sub(r"[^A-Za-z0-9 _-]+", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = cleaned.strip(" .-_")
+    words = cleaned.split()
+    if not words:
+        return ""
+    cleaned_words = words[:6]
+    trailing_noise = {
+        "a", "an", "and", "as", "at", "by", "due", "for", "from", "in", "into",
+        "of", "on", "or", "the", "to", "with",
+    }
+    while cleaned_words and cleaned_words[-1].lower() in trailing_noise:
+        cleaned_words.pop()
+    return " ".join(cleaned_words)
+
+
+def sanitize_metadata_summary(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip().strip("\"'`")
+    return cleaned[:180]
+
+
+def sanitize_tags(raw_tags: object) -> list[str]:
+    if not isinstance(raw_tags, list):
+        return []
+    cleaned: list[str] = []
+    for item in raw_tags:
+        value = re.sub(r"[^A-Za-z0-9 +_-]+", "", str(item)).strip(" -_")
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered not in {tag.lower() for tag in cleaned}:
+            cleaned.append(value[:24])
+    return cleaned[:4]
+
+
+def build_metadata_user_prompt(text: str, source_kind: str, title_hint: str | None) -> str:
+    title_value = title_hint or "none"
+    excerpt = text[:6000].strip()
+    return f"""Create a concise title and metadata for this spoken-content job.
+
+Context:
+- source_kind: {source_kind}
+- language: en
+- title_hint: {title_value}
+
+Source text:
+{excerpt}
+"""
+
+
+def extract_text_message(body: dict[str, object]) -> str:
+    message = body["choices"][0]["message"]
+    content = (message.get("content") or "").strip()
+    if not content:
+        content = (message.get("reasoning_content") or "").strip()
+    if not content:
+        raise RuntimeError("Metadata model returned neither content nor reasoning_content.")
+    return content
+
+
+def extract_json_message(body: dict[str, object]) -> dict[str, object]:
+    content = extract_text_message(body).strip()
+    content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"\s*```$", "", content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(content[start : end + 1])
+        raise RuntimeError("Metadata model returned invalid JSON.")
+
+
+def generate_title_metadata(
+    text: str,
+    *,
+    source_kind: str,
+    title_hint: str | None,
+    base_url: str,
+    model: str,
+    identifier: str,
+    context_length: int,
+    ttl_seconds: int,
+    lms_bin: str,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    loaded_by_us = ensure_metadata_model_loaded(
+        model=model,
+        identifier=identifier,
+        context_length=context_length,
+        ttl_seconds=ttl_seconds,
+        lms_bin=lms_bin,
+    )
+    payload = {
+        "model": identifier,
+        "temperature": 0.1,
+        "max_tokens": 120,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "article_tts_metadata",
+                "schema": METADATA_SCHEMA,
+                "strict": True,
+            },
+        },
+        "messages": [
+            {"role": "system", "content": METADATA_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_metadata_user_prompt(
+                    text,
+                    source_kind=source_kind,
+                    title_hint=title_hint,
+                ),
+            },
+        ],
+    }
+    response = requests.post(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        json=payload,
+        timeout=timeout_seconds,
+    )
+    try:
+        response.raise_for_status()
+        data = extract_json_message(response.json())
+        summary_name = sanitize_summary_name(str(data.get("summary_name", "")))
+        if not summary_name:
+            raise RuntimeError("Metadata summary_name was empty after sanitization.")
+        return {
+            "summary_name": summary_name,
+            "summary": sanitize_metadata_summary(str(data.get("summary", ""))),
+            "tags": sanitize_tags(data.get("tags", [])),
+            "model": model,
+            "identifier": identifier,
+        }
+    finally:
+        if loaded_by_us:
+            try:
+                unload_metadata_model(identifier=identifier, lms_bin=lms_bin)
+            except Exception:
+                pass
+
+
+def build_named_artifact_paths(job_dir: Path, title: str) -> dict[str, Path]:
+    timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    stem = f"{timestamp}-{slugify(title[:80])}"
+    return {
+        "text_path": job_dir / f"{stem}.txt",
+        "audio_path": job_dir / f"{stem}.wav",
+    }
+
+
+def run_lms(args: list[str], *, lms_bin: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([lms_bin, *args], check=True, capture_output=True, text=True)
+
+
+def ensure_metadata_server_running(*, lms_bin: str) -> None:
+    status = run_lms(["server", "status"], lms_bin=lms_bin)
+    if "not running" in (status.stdout + status.stderr).lower():
+        run_lms(["server", "start"], lms_bin=lms_bin)
+
+
+def loaded_model_identifiers(*, lms_bin: str) -> set[str]:
+    result = run_lms(["ps", "--json"], lms_bin=lms_bin)
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(payload, list):
+        return set()
+    identifiers: set[str] = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        for key in ("identifier", "id"):
+            value = item.get(key)
+            if value:
+                identifiers.add(str(value))
+    return identifiers
+
+
+def ensure_metadata_model_loaded(
+    *,
+    model: str,
+    identifier: str,
+    context_length: int,
+    ttl_seconds: int,
+    lms_bin: str,
+) -> bool:
+    ensure_metadata_server_running(lms_bin=lms_bin)
+    if identifier in loaded_model_identifiers(lms_bin=lms_bin):
+        return False
+    run_lms(
+        [
+            "load",
+            model,
+            "--identifier",
+            identifier,
+            "--ttl",
+            str(ttl_seconds),
+            "-c",
+            str(context_length),
+            "--parallel",
+            "1",
+            "-y",
+        ],
+        lms_bin=lms_bin,
+    )
+    return True
+
+
+def unload_metadata_model(*, identifier: str, lms_bin: str) -> None:
+    run_lms(["unload", identifier], lms_bin=lms_bin)
+
+
+def fallback_extract(html: str) -> tuple[str | None, str]:
+    document = Document(html)
+    title = document.short_title() or None
+    summary_html = document.summary()
+    soup = BeautifulSoup(summary_html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    text = soup.get_text("\n", strip=True)
+    return title, clean_text(text)
+
+
+def extract_article(url: str, html: str) -> tuple[str, str]:
+    metadata = trafilatura.extract_metadata(html)
+    title = metadata.title if metadata and metadata.title else None
+
+    extracted = trafilatura.extract(
+        html,
+        url=url,
+        include_comments=False,
+        include_tables=True,
+        include_formatting=False,
+        favor_precision=True,
+        deduplicate=True,
+        output_format="txt",
+        with_metadata=False,
+    )
+
+    text = clean_text(extracted or "")
+    if len(text) >= 400:
+        return title or "article", text
+
+    fallback_title, fallback_text = fallback_extract(html)
+    title = title or fallback_title or "article"
+    if fallback_text:
+        return title, fallback_text
+
+    if text:
+        return title or "article", text
+
+    raise RuntimeError("Could not extract meaningful article text from the page.")
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "article"
+
+
+def count_han_characters(text: str) -> int:
+    return sum(
+        1
+        for char in text
+        if (
+            "\u3400" <= char <= "\u4dbf"
+            or "\u4e00" <= char <= "\u9fff"
+            or "\uf900" <= char <= "\ufaff"
+        )
+    )
+
+
+def count_latin_letters(text: str) -> int:
+    return sum(1 for char in text if ("A" <= char <= "Z") or ("a" <= char <= "z"))
+
+
+def count_latin_words(text: str) -> int:
+    return len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
+
+
+def is_mandarin_voice(voice: str) -> bool:
+    return voice.startswith("zf_") or voice.startswith("zm_")
+
+
+def detect_language(text: str) -> dict[str, object]:
+    han_chars = count_han_characters(text)
+    latin_letters = count_latin_letters(text)
+    latin_words = count_latin_words(text)
+
+    if han_chars == 0:
+        return {
+            "lang": "en-us",
+            "reason": "No Han characters detected.",
+            "han_chars": han_chars,
+            "latin_letters": latin_letters,
+            "latin_words": latin_words,
+        }
+
+    if han_chars >= 2 and latin_letters == 0:
+        return {
+            "lang": "cmn",
+            "reason": "Only Han script detected.",
+            "han_chars": han_chars,
+            "latin_letters": latin_letters,
+            "latin_words": latin_words,
+        }
+
+    if han_chars >= 10 and han_chars >= int(latin_letters * 0.8):
+        return {
+            "lang": "cmn",
+            "reason": "Han script dominates or is at least comparable to Latin text.",
+            "han_chars": han_chars,
+            "latin_letters": latin_letters,
+            "latin_words": latin_words,
+        }
+
+    if han_chars >= 24:
+        return {
+            "lang": "cmn",
+            "reason": "Large Han-script span detected.",
+            "han_chars": han_chars,
+            "latin_letters": latin_letters,
+            "latin_words": latin_words,
+        }
+
+    return {
+        "lang": "en-us",
+        "reason": "Latin text dominates and Han script appears incidental.",
+        "han_chars": han_chars,
+        "latin_letters": latin_letters,
+        "latin_words": latin_words,
+    }
+
+
+def resolve_language_and_voice(
+    text: str,
+    requested_lang: str,
+    requested_voice: str,
+) -> tuple[str, str, dict[str, object]]:
+    if requested_lang != "auto":
+        return requested_lang, requested_voice, {
+            "mode": "manual",
+            "reason": f"Language forced via --lang {requested_lang}.",
+            "requested_lang": requested_lang,
+        }
+
+    detection = detect_language(text)
+    resolved_lang = str(detection["lang"])
+    resolved_voice = requested_voice
+
+    if resolved_lang == "cmn" and not is_mandarin_voice(requested_voice):
+        resolved_voice = DEFAULT_MANDARIN_VOICE
+        detection["voice_fallback"] = {
+            "from": requested_voice,
+            "to": resolved_voice,
+            "reason": "Mandarin text detected with a non-Mandarin voice.",
+        }
+
+    detection["mode"] = "auto"
+    detection["requested_lang"] = requested_lang
+    return resolved_lang, resolved_voice, detection
+
+
+def split_into_chunks(text: str, max_chars: int = 900) -> list[str]:
+    paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
+    chunks: list[str] = []
+
+    for paragraph in paragraphs:
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        current = ""
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            if len(sentence) > max_chars:
+                words = sentence.split()
+                overflow = ""
+                for word in words:
+                    candidate = f"{overflow} {word}".strip()
+                    if overflow and len(candidate) > max_chars:
+                        chunks.append(overflow)
+                        overflow = word
+                    else:
+                        overflow = candidate
+                if overflow:
+                    if current:
+                        chunks.append(current)
+                        current = ""
+                    chunks.append(overflow)
+                continue
+
+            candidate = f"{current} {sentence}".strip()
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = sentence
+            else:
+                current = candidate
+
+        if current:
+            chunks.append(current)
+
+    return chunks
+
+
+class ProgressReporter:
+    def __init__(self, json_mode: bool) -> None:
+        self.json_mode = json_mode
+
+    def emit(self, event_type: str, **payload: object) -> None:
+        if self.json_mode:
+            print(json.dumps({"type": event_type, **payload}, ensure_ascii=True), flush=True)
+        elif event_type == "stage":
+            print(str(payload.get("message", "")), flush=True)
+        elif event_type in {"chunk", "progress"}:
+            print(
+                f"Chunk {payload.get('current', '?')}/{payload.get('total', '?')}",
+                flush=True,
+            )
+
+
+def synthesize(
+    text: str,
+    voice: str,
+    lang: str,
+    speed: float,
+    reporter: ProgressReporter | None = None,
+) -> tuple[np.ndarray, int]:
+    kokoro = build_kokoro()
+    chunks = split_into_chunks(text)
+    if not chunks:
+        raise RuntimeError("No text remained after chunking.")
+
+    rendered: list[np.ndarray] = []
+    sample_rate: int | None = None
+
+    total = len(chunks)
+    if reporter:
+        reporter.emit("stage", name="synthesizing", message=f"Rendering {total} audio chunks", total=total)
+    else:
+        print(f"Rendering {total} audio chunks...", flush=True)
+    for index, chunk in enumerate(chunks, start=1):
+        if reporter:
+            reporter.emit("progress", current=index, total=total, characters=len(chunk), stage="synthesizing")
+        else:
+            print(f"Chunk {index}/{total}", flush=True)
+        samples, current_rate = kokoro.create(chunk, voice=voice, speed=speed, lang=lang)
+        if sample_rate is None:
+            sample_rate = current_rate
+        elif current_rate != sample_rate:
+            raise RuntimeError(
+                f"Unexpected sample-rate change: {sample_rate} vs {current_rate}"
+            )
+        rendered.append(samples)
+        rendered.append(np.zeros(int(current_rate * 0.18), dtype=np.float32))
+
+    if sample_rate is None:
+        raise RuntimeError("Kokoro did not return audio.")
+
+    audio = np.concatenate(rendered)
+    return audio, sample_rate
+
+
+def play_audio(path: Path) -> None:
+    commands = [
+        ["afplay", str(path)],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", str(path)],
+    ]
+    errors: list[str] = []
+
+    for command in commands:
+        try:
+            subprocess.run(command, check=True)
+            return
+        except FileNotFoundError:
+            errors.append(f"{command[0]} not found")
+        except subprocess.CalledProcessError as exc:
+            errors.append(f"{command[0]} exited with {exc.returncode}")
+
+    raise RuntimeError("Playback failed: " + "; ".join(errors))
+
+
+def output_paths(output_dir: Path, title: str) -> tuple[Path, Path]:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"{timestamp}-{slugify(title)}"
+    return output_dir / f"{stem}.txt", output_dir / f"{stem}.wav"
+
+
+def ensure_job_paths(output_dir: Path, job_id: str) -> dict[str, Path]:
+    job_dir = output_dir / "jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "job_dir": job_dir,
+        "manifest_path": job_dir / "manifest.json",
+        "input_path": job_dir / "input.txt",
+        "text_path": job_dir / "cleaned.txt",
+        "audio_path": job_dir / "audio.wav",
+        "error_path": job_dir / "error.txt",
+    }
+
+
+def write_manifest(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def looks_like_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://")
+
+
+def resolve_input(
+    args: argparse.Namespace,
+    reporter: ProgressReporter | None = None,
+) -> tuple[str, str, str, str]:
+    if args.text:
+        text = clean_text(args.text)
+        return args.title or derive_title_from_text(text), text, "text", args.text
+
+    if args.text_file:
+        raw = args.text_file.read_text(encoding="utf-8")
+        text = clean_text(raw)
+        return args.title or derive_title_from_text(text), text, "text-file", str(args.text_file)
+
+    if args.stdin or (not sys.stdin.isatty() and not args.source):
+        raw = sys.stdin.read()
+        text = clean_text(raw)
+        if not text:
+            raise RuntimeError("No text was provided on stdin.")
+        return args.title or derive_title_from_text(text), text, "stdin", raw
+
+    if not args.source:
+        raise RuntimeError("Provide a URL, --text, --text-file, or pipe text on stdin.")
+
+    if looks_like_url(args.source):
+        if reporter:
+            reporter.emit("stage", name="fetching_url", message="Fetching article URL")
+        html = fetch_html(args.source)
+        if reporter:
+            reporter.emit("stage", name="extracting_article", message="Extracting article text")
+        title, article_text = extract_article(args.source, html)
+        return args.title or title, article_text, "url", args.source
+
+    text = clean_text(args.source)
+    return args.title or derive_title_from_text(text), text, "text", args.source
+
+
+def list_voices() -> int:
+    kokoro = build_kokoro()
+    for voice in kokoro.get_voices():
+        print(voice)
+    return 0
+
+
+def list_voices_json() -> int:
+    kokoro = build_kokoro()
+    print(json.dumps({"voices": kokoro.get_voices()}, ensure_ascii=True))
+    return 0
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remaining = seconds - (minutes * 60)
+    return f"{minutes}m {remaining:.1f}s"
+
+
+def make_voice_preview(args: argparse.Namespace, reporter: ProgressReporter) -> int:
+    kokoro = build_kokoro()
+    voices = kokoro.get_voices()
+    preview_dir = args.output_dir / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = f"all-voices-{slugify(args.preview_text[:80])}"
+    wav_path = preview_dir / f"{stem}.wav"
+    manifest_path = preview_dir / f"{stem}.json"
+    index_path = preview_dir / f"{stem}.txt"
+
+    reporter.emit(
+        "stage",
+        name="preview_all_voices",
+        message=f"Rendering preview for {len(voices)} voices",
+        total=len(voices),
+    )
+
+    audio_parts: list[np.ndarray] = []
+    sample_rate: int | None = None
+    offsets: list[dict[str, object]] = []
+    cursor_seconds = 0.0
+
+    for index, voice in enumerate(voices, start=1):
+        reporter.emit("progress", current=index, total=len(voices), voice=voice, stage="preview_all_voices")
+        prompt = preview_prompt_for_voice(voice, args.preview_text)
+        preview_lang = "cmn" if is_mandarin_voice(voice) and count_han_characters(args.preview_text) > 0 else "en-us"
+        samples, current_rate = kokoro.create(prompt, voice=voice, speed=args.speed, lang=preview_lang)
+        if sample_rate is None:
+            sample_rate = current_rate
+        elif sample_rate != current_rate:
+            raise RuntimeError(f"Unexpected sample-rate change: {sample_rate} vs {current_rate}")
+
+        silence = np.zeros(int(current_rate * 0.45), dtype=np.float32)
+        duration_seconds = len(samples) / current_rate
+        offsets.append(
+            {
+                "voice": voice,
+                "start_seconds": round(cursor_seconds, 3),
+                "duration_seconds": round(duration_seconds, 3),
+            }
+        )
+        audio_parts.append(samples)
+        audio_parts.append(silence)
+        cursor_seconds += duration_seconds + (len(silence) / current_rate)
+
+    if sample_rate is None:
+        raise RuntimeError("No preview audio was generated.")
+
+    sf.write(wav_path, np.concatenate(audio_parts), sample_rate)
+    write_manifest(
+        manifest_path,
+        {
+            "kind": "voice-preview",
+            "preview_text": args.preview_text,
+            "prompt_template": "This is {voice}. {preview_text}",
+            "voice_count": len(voices),
+            "audio_path": str(wav_path),
+            "index": offsets,
+        },
+    )
+    index_path.write_text(
+        "\n".join(
+            f"{item['voice']}\t{item['start_seconds']}s\t{item['duration_seconds']}s"
+            for item in offsets
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    reporter.emit(
+        "result",
+        kind="voice-preview",
+        audio_path=str(wav_path),
+        manifest_path=str(manifest_path),
+        index_path=str(index_path),
+    )
+    if not args.json_events and not args.json_progress:
+        print(f"Preview audio: {wav_path}")
+        print(f"Preview index: {index_path}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    args.speed = clamp_speed(args.speed)
+    json_mode = args.json_events or args.json_progress
+    reporter = ProgressReporter(json_mode)
+
+    if args.list_voices:
+        return list_voices()
+
+    if args.list_voices_json:
+        return list_voices_json()
+
+    if args.preview_all_voices:
+        require_models()
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        return make_voice_preview(args, reporter)
+
+    require_models()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_start = time.perf_counter()
+    input_elapsed = 0.0
+    synth_elapsed = 0.0
+    title = args.title or "untitled"
+    metadata_summary = ""
+    metadata_tags: list[str] = []
+    metadata_model_used = ""
+    resolved_lang = args.lang
+    resolved_voice = args.voice
+    language_detection: dict[str, object] = {"mode": "manual", "reason": "Language routing not evaluated yet."}
+    source_kind = ""
+    source_value = ""
+    job_id = args.job_id or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    job_paths = ensure_job_paths(args.output_dir, job_id)
+    manifest_path = job_paths["manifest_path"]
+
+    try:
+        input_start = time.perf_counter()
+        reporter.emit("stage", name="input", message="Preparing input", job_id=job_id)
+        title, article_text, source_kind, source_value = resolve_input(args, reporter=reporter)
+        input_elapsed = time.perf_counter() - input_start
+        resolved_lang, resolved_voice, language_detection = resolve_language_and_voice(
+            article_text,
+            args.lang,
+            args.voice,
+        )
+        reporter.emit(
+            "stage",
+            name="language_routing",
+            message=f"Resolved language {resolved_lang} with voice {resolved_voice}",
+            job_id=job_id,
+            requested_lang=args.lang,
+            requested_voice=args.voice,
+            resolved_lang=resolved_lang,
+            resolved_voice=resolved_voice,
+            language_detection=language_detection,
+        )
+
+        if args.metadata_only:
+            metadata = generate_title_metadata(
+                article_text,
+                source_kind=source_kind,
+                title_hint=title,
+                base_url=args.metadata_base_url,
+                model=args.metadata_model,
+                identifier=args.metadata_identifier,
+                context_length=args.metadata_context_length,
+                ttl_seconds=args.metadata_ttl,
+                lms_bin=args.lms_bin,
+                timeout_seconds=args.metadata_timeout,
+            )
+            if json_mode:
+                reporter.emit(
+                    "result",
+                    kind="metadata",
+                    title=str(metadata["summary_name"]),
+                    metadata_summary=str(metadata["summary"]),
+                    metadata_tags=sanitize_tags(metadata["tags"]),
+                    metadata_model=str(metadata["model"]),
+                )
+            else:
+                print(json.dumps(metadata, ensure_ascii=True, indent=2))
+            return 0
+
+        reporter.emit("stage", name="writing_text", message="Writing extracted text", job_id=job_id)
+        job_paths["input_path"].write_text(source_value, encoding="utf-8")
+        job_paths["text_path"].write_text(article_text, encoding="utf-8")
+
+        metadata_future: concurrent.futures.Future[dict[str, object]] | None = None
+        if not args.no_metadata:
+            reporter.emit("stage", name="metadata", message="Generating local title metadata", job_id=job_id)
+            metadata_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            metadata_future = metadata_executor.submit(
+                generate_title_metadata,
+                article_text,
+                source_kind=source_kind,
+                title_hint=title,
+                base_url=args.metadata_base_url,
+                model=args.metadata_model,
+                identifier=args.metadata_identifier,
+                context_length=args.metadata_context_length,
+                ttl_seconds=args.metadata_ttl,
+                lms_bin=args.lms_bin,
+                timeout_seconds=args.metadata_timeout,
+            )
+        else:
+            metadata_executor = None
+
+        synth_start = time.perf_counter()
+        audio, sample_rate = synthesize(article_text, resolved_voice, resolved_lang, args.speed, reporter=reporter)
+        synth_elapsed = time.perf_counter() - synth_start
+
+        final_title = title
+        try:
+            if metadata_future is not None:
+                metadata = metadata_future.result(timeout=max(args.metadata_timeout, 1.0))
+                final_title = str(metadata.get("summary_name", final_title)) or final_title
+                metadata_summary = str(metadata.get("summary", "")).strip()
+                metadata_tags = sanitize_tags(metadata.get("tags", []))
+                metadata_model_used = str(metadata.get("model", "")).strip()
+                reporter.emit("stage", name="metadata_ready", message=f"Metadata title: {final_title}", job_id=job_id)
+        except Exception as exc:
+            reporter.emit("stage", name="metadata_fallback", message=f"Metadata fallback: {exc}", job_id=job_id)
+        finally:
+            if metadata_executor is not None:
+                metadata_executor.shutdown(wait=False)
+
+        artifact_paths = build_named_artifact_paths(job_paths["job_dir"], final_title)
+        reporter.emit("stage", name="writing_audio", message="Writing audio file", job_id=job_id)
+        artifact_paths["text_path"].write_text(article_text, encoding="utf-8")
+        sf.write(artifact_paths["audio_path"], audio, sample_rate)
+        total_elapsed = time.perf_counter() - total_start
+
+        manifest = {
+            "kind": "job",
+            "job_id": job_id,
+            "status": "completed",
+            "title": final_title,
+            "source_kind": source_kind,
+            "source_value": source_value,
+            "voice": resolved_voice,
+            "requested_voice": args.voice,
+            "lang": resolved_lang,
+            "requested_lang": args.lang,
+            "speed": args.speed,
+            "language_detection": language_detection,
+            "metadata_summary": metadata_summary,
+            "metadata_tags": metadata_tags,
+            "metadata_model": metadata_model_used,
+            "job_dir": str(job_paths["job_dir"]),
+            "input_path": str(job_paths["input_path"]),
+            "text_path": str(artifact_paths["text_path"]),
+            "audio_path": str(artifact_paths["audio_path"]),
+            "created_at": datetime.now().isoformat(),
+            "timings": {
+                "input_seconds": round(input_elapsed, 3),
+                "render_seconds": round(synth_elapsed, 3),
+                "total_seconds": round(total_elapsed, 3),
+            },
+        }
+        write_manifest(manifest_path, manifest)
+
+        if json_mode:
+            reporter.emit(
+                "result",
+                kind="job",
+                status="completed",
+                job_id=job_id,
+                title=final_title,
+                job_dir=str(job_paths["job_dir"]),
+                manifest_path=str(manifest_path),
+                text_path=str(artifact_paths["text_path"]),
+                audio_path=str(artifact_paths["audio_path"]),
+                voice=resolved_voice,
+                requested_voice=args.voice,
+                lang=resolved_lang,
+                requested_lang=args.lang,
+                language_detection=language_detection,
+                metadata_summary=metadata_summary,
+                metadata_tags=metadata_tags,
+                metadata_model=metadata_model_used,
+                input_prep_seconds=round(input_elapsed, 3),
+                tts_render_seconds=round(synth_elapsed, 3),
+                total_seconds=round(total_elapsed, 3),
+            )
+        else:
+            print(f"Title: {final_title}")
+            print(f"Text: {artifact_paths['text_path']}")
+            print(f"Audio: {artifact_paths['audio_path']}")
+            print(f"Job dir: {job_paths['job_dir']}")
+            print(f"Input prep: {format_duration(input_elapsed)}")
+            print(f"TTS render: {format_duration(synth_elapsed)}")
+            print(f"Total: {format_duration(total_elapsed)}")
+
+        if not args.no_play:
+            reporter.emit("stage", name="playback", message="Playing audio", job_id=job_id)
+            play_audio(artifact_paths["audio_path"])
+
+        return 0
+    except Exception as exc:
+        total_elapsed = time.perf_counter() - total_start
+        job_paths["error_path"].write_text(str(exc) + "\n", encoding="utf-8")
+        write_manifest(
+            manifest_path,
+            {
+                "kind": "job",
+                "job_id": job_id,
+                "status": "failed",
+                "title": title,
+                "source_kind": source_kind,
+                "source_value": source_value,
+                "voice": resolved_voice,
+                "requested_voice": args.voice,
+                "lang": resolved_lang,
+                "requested_lang": args.lang,
+                "speed": args.speed,
+                "language_detection": language_detection,
+                "metadata_summary": metadata_summary,
+                "metadata_tags": metadata_tags,
+                "metadata_model": metadata_model_used,
+                "job_dir": str(job_paths["job_dir"]),
+                "input_path": str(job_paths["input_path"]),
+                "text_path": str(job_paths["text_path"]),
+                "audio_path": str(job_paths["audio_path"]),
+                "error_path": str(job_paths["error_path"]),
+                "error": str(exc),
+                "created_at": datetime.now().isoformat(),
+                "timings": {
+                    "input_seconds": round(input_elapsed, 3),
+                    "render_seconds": round(synth_elapsed, 3),
+                    "total_seconds": round(total_elapsed, 3),
+                },
+            },
+        )
+        reporter.emit(
+            "error",
+            job_id=job_id,
+            manifest_path=str(manifest_path),
+            error_path=str(job_paths["error_path"]),
+            message=str(exc),
+        )
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        if "--json-progress" in sys.argv or "--json-events" in sys.argv:
+            print(json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=True), flush=True)
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        raise SystemExit(130)
