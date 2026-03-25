@@ -131,17 +131,19 @@ The default language mode is `auto`.
 
 Current behavior:
 
-- mostly English text resolves to `en-us`
-- mostly Chinese text resolves to `cmn`
-- short pure-Chinese inputs like `道德经` resolve to `cmn`
-- incidental Chinese inside mainly English text stays `en-us`
-- if Chinese is detected while a non-Mandarin voice is selected, the bridge falls back to `zf_xiaobei`
+- the backend supports the Kokoro voice-language families shipped in this build: `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`
+- the bundled espeak backend advertises many more phonemizer languages, but the Kokoro voice set in this repo only has voices for the families above
+- auto mode scores the text with lightweight script, accent, and word hints instead of a binary English-vs-Mandarin rule
+- the selected voice acts as a tie-breaker when the input is ambiguous
+- when auto mode detects a language family that does not match the selected voice, the bridge falls back to that family’s default voice
+- common aliases are normalized, so `en`, `fr`, `pt`, `zh`, and `es-419` map to the appropriate Kokoro language code
 
 You can still force a language explicitly:
 
 ```bash
 ./speak-article --text "Hello world" --lang en-us
 ./speak-article --text "道德经" --lang cmn --voice zf_xiaobei
+./speak-article --text "Bonjour le monde" --lang fr-fr --voice ff_siwis
 ```
 
 ## Title Metadata

@@ -11,6 +11,7 @@ import time
 import traceback
 import uuid
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import requests
 import soundfile as sf
 import trafilatura
 from bs4 import BeautifulSoup
-from kokoro_onnx import Kokoro
+from kokoro_onnx import Kokoro, MAX_PHONEME_LENGTH
 from readability import Document
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -32,7 +33,6 @@ MODEL_PATH = MODELS_DIR / "kokoro-v1.0.int8.onnx"
 VOICES_PATH = MODELS_DIR / "voices-v1.0.bin"
 DEFAULT_VOICE = "af_alloy"
 DEFAULT_LANG = "auto"
-DEFAULT_MANDARIN_VOICE = "zf_xiaobei"
 DEFAULT_PREVIEW_TEXT = "The quick brown fox jumps over the lazy dog."
 DEFAULT_METADATA_BASE_URL = os.getenv("ARTICLE_TTS_METADATA_BASE_URL", "http://127.0.0.1:1234")
 DEFAULT_METADATA_MODEL = os.getenv(
@@ -45,6 +45,9 @@ DEFAULT_METADATA_TTL = 90
 DEFAULT_LMS_BIN = os.getenv("ARTICLE_TTS_LMS_BIN", "lms")
 DEFAULT_METADATA_TIMEOUT = 30.0
 DEFAULT_CHUNK_MAX_CHARS = 420
+DEFAULT_CHUNK_MAX_PHONEMES = max(MAX_PHONEME_LENGTH - 30, 1)
+DEFAULT_LANGUAGE_CODE = "en-us"
+VOICE_PRIOR_WEIGHT = 0.5
 METADATA_SYSTEM_PROMPT = """You create short descriptive metadata for articles and pasted text.
 
 Return only JSON matching the provided schema.
@@ -71,6 +74,146 @@ METADATA_SCHEMA = {
 }
 
 
+@dataclass(frozen=True)
+class LanguageProfile:
+    code: str
+    default_voice: str
+    voice_prefixes: tuple[str, ...]
+    aliases: tuple[str, ...] = ()
+    word_hints: tuple[str, ...] = ()
+    char_hints: tuple[str, ...] = ()
+    script_ranges: tuple[tuple[int, int], ...] = ()
+
+
+LANGUAGE_PROFILES: tuple[LanguageProfile, ...] = (
+    LanguageProfile(
+        code="en-us",
+        default_voice="af_alloy",
+        voice_prefixes=("af", "am"),
+        aliases=("en", "en-us", "en_us", "english"),
+        word_hints=(
+            "the",
+            "and",
+            "of",
+            "to",
+            "in",
+            "is",
+            "it",
+            "that",
+            "for",
+            "with",
+            "as",
+            "was",
+            "are",
+            "this",
+            "be",
+            "from",
+            "or",
+            "by",
+            "on",
+            "an",
+            "not",
+        ),
+    ),
+    LanguageProfile(
+        code="en-gb",
+        default_voice="bf_isabella",
+        voice_prefixes=("bf", "bm"),
+        aliases=("en-gb", "en_gb", "en-uk", "en_uk", "british"),
+        word_hints=(
+            "the",
+            "and",
+            "of",
+            "to",
+            "in",
+            "is",
+            "it",
+            "that",
+            "for",
+            "with",
+            "as",
+            "was",
+            "are",
+            "this",
+            "be",
+            "from",
+            "or",
+            "by",
+            "on",
+            "an",
+            "not",
+        ),
+    ),
+    LanguageProfile(
+        code="es",
+        default_voice="ef_dora",
+        voice_prefixes=("ef", "em"),
+        aliases=("es", "es-419", "es_419", "spanish"),
+        word_hints=("el", "la", "de", "que", "y", "en", "los", "por", "para", "con", "una", "del", "las", "no"),
+        char_hints=("ñ", "¿", "¡", "á", "é", "í", "ó", "ú", "ü"),
+    ),
+    LanguageProfile(
+        code="fr-fr",
+        default_voice="ff_siwis",
+        voice_prefixes=("ff",),
+        aliases=("fr", "fr-fr", "fr_be", "fr-be", "fr_ch", "fr-ch", "french"),
+        word_hints=("le", "la", "de", "et", "les", "des", "un", "une", "que", "dans", "pour", "est", "pas"),
+        char_hints=("à", "â", "æ", "ç", "é", "è", "ê", "ë", "î", "ï", "ô", "œ", "ù", "û", "ü", "ÿ"),
+    ),
+    LanguageProfile(
+        code="hi",
+        default_voice="hf_alpha",
+        voice_prefixes=("hf", "hm"),
+        aliases=("hi", "hindi"),
+        script_ranges=((0x0900, 0x097F),),
+    ),
+    LanguageProfile(
+        code="it",
+        default_voice="if_sara",
+        voice_prefixes=("if", "im"),
+        aliases=("it", "italian"),
+        word_hints=("il", "lo", "la", "di", "che", "e", "un", "una", "per", "con", "non", "del", "della"),
+        char_hints=("à", "è", "é", "ì", "ò", "ù"),
+    ),
+    LanguageProfile(
+        code="ja",
+        default_voice="jf_alpha",
+        voice_prefixes=("jf", "jm"),
+        aliases=("ja", "japanese"),
+        script_ranges=((0x3040, 0x30FF),),
+    ),
+    LanguageProfile(
+        code="pt-br",
+        default_voice="pf_dora",
+        voice_prefixes=("pf", "pm"),
+        aliases=("pt", "pt-br", "pt_br", "portuguese"),
+        word_hints=("de", "que", "e", "o", "a", "os", "as", "um", "uma", "para", "com", "não", "por", "da"),
+        char_hints=("ã", "õ", "ç", "á", "à", "â", "é", "ê", "í", "ó", "ô", "ú"),
+    ),
+    LanguageProfile(
+        code="cmn",
+        default_voice="zf_xiaobei",
+        voice_prefixes=("zf", "zm"),
+        aliases=("cmn", "cmn-latn-pinyin", "zh", "zh-cn", "zh_cn", "mandarin"),
+        script_ranges=((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF)),
+    ),
+)
+
+LANGUAGE_PROFILE_BY_CODE = {profile.code: profile for profile in LANGUAGE_PROFILES}
+LANGUAGE_ALIAS_TO_CODE = {
+    alias.casefold().replace("_", "-"): profile.code
+    for profile in LANGUAGE_PROFILES
+    for alias in profile.aliases
+}
+VOICE_PREFIX_TO_LANGUAGE_CODE = {
+    prefix: profile.code
+    for profile in LANGUAGE_PROFILES
+    for prefix in profile.voice_prefixes
+}
+SUPPORTED_LANGUAGE_CODES = tuple(profile.code for profile in LANGUAGE_PROFILES)
+SUPPORTED_LANGUAGE_HELP = ", ".join(SUPPORTED_LANGUAGE_CODES)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch an article URL or accept raw text, synthesize speech, and play it."
@@ -84,7 +227,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lang",
         default=DEFAULT_LANG,
-        help=f"Kokoro language code. Use 'auto', 'en-us', or 'cmn'. Default: {DEFAULT_LANG}",
+        help=(
+            "Kokoro language code. Use 'auto' or one of: "
+            f"{SUPPORTED_LANGUAGE_HELP}. Common aliases like en, fr, pt, zh, and es-419 are normalized. "
+            f"Default: {DEFAULT_LANG}"
+        ),
     )
     parser.add_argument("--speed", type=float, default=1.0, help="Speech speed multiplier")
     parser.add_argument("--metadata-only", action="store_true", help="Generate title metadata JSON and exit")
@@ -526,77 +673,125 @@ def slugify(value: str) -> str:
     return slug or "article"
 
 
-def count_han_characters(text: str) -> int:
-    return sum(
-        1
-        for char in text
-        if (
-            "\u3400" <= char <= "\u4dbf"
-            or "\u4e00" <= char <= "\u9fff"
-            or "\uf900" <= char <= "\ufaff"
-        )
-    )
+def count_characters_in_ranges(text: str, ranges: tuple[tuple[int, int], ...]) -> int:
+    total = 0
+    for char in text:
+        codepoint = ord(char)
+        if any(start <= codepoint <= end for start, end in ranges):
+            total += 1
+    return total
 
 
-def count_latin_letters(text: str) -> int:
-    return sum(1 for char in text if ("A" <= char <= "Z") or ("a" <= char <= "z"))
+def normalize_language_code(value: str) -> str:
+    normalized = value.strip().casefold().replace("_", "-")
+    return LANGUAGE_ALIAS_TO_CODE.get(normalized, normalized)
 
 
-def count_latin_words(text: str) -> int:
-    return len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
+def profile_for_language(code: str) -> LanguageProfile | None:
+    return LANGUAGE_PROFILE_BY_CODE.get(normalize_language_code(code))
+
+
+def profile_for_voice(voice: str) -> LanguageProfile | None:
+    prefix = voice.split("_", 1)[0]
+    code = VOICE_PREFIX_TO_LANGUAGE_CODE.get(prefix)
+    if code is None:
+        return None
+    return LANGUAGE_PROFILE_BY_CODE.get(code)
+
+
+def language_code_for_voice(voice: str) -> str | None:
+    profile = profile_for_voice(voice)
+    return profile.code if profile else None
+
+
+def default_voice_for_language(code: str) -> str | None:
+    profile = profile_for_language(code)
+    return profile.default_voice if profile else None
 
 
 def is_mandarin_voice(voice: str) -> bool:
-    return voice.startswith("zf_") or voice.startswith("zm_")
+    return language_code_for_voice(voice) == "cmn"
 
 
-def detect_language(text: str) -> dict[str, object]:
-    han_chars = count_han_characters(text)
-    latin_letters = count_latin_letters(text)
-    latin_words = count_latin_words(text)
+def preview_language_for_voice(voice: str, text: str) -> str:
+    detection = detect_language(text, preferred_voice=voice)
+    return str(detection["lang"])
 
-    if han_chars == 0:
+
+def count_word_hints(tokens: list[str], hints: tuple[str, ...]) -> int:
+    hint_set = set(hints)
+    return sum(1 for token in tokens if token in hint_set)
+
+
+def score_language_profile(text: str, tokens: list[str], profile: LanguageProfile) -> tuple[float, dict[str, int]]:
+    evidence: dict[str, int] = {}
+    score = 0.0
+
+    if profile.script_ranges:
+        script_count = count_characters_in_ranges(text, profile.script_ranges)
+        if script_count:
+            evidence["script_chars"] = script_count
+            score += script_count * 4.0
+
+    if profile.char_hints:
+        hint_count = sum(text.count(char) for char in profile.char_hints)
+        if hint_count:
+            evidence["char_hints"] = hint_count
+            score += hint_count * 3.0
+
+    if profile.word_hints:
+        word_hits = count_word_hints(tokens, profile.word_hints)
+        if word_hits:
+            evidence["word_hints"] = word_hits
+            score += word_hits * 1.5
+
+    return score, evidence
+
+
+def detect_language(text: str, preferred_voice: str | None = None) -> dict[str, object]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    tokens = re.findall(r"[\w']+", normalized.casefold())
+    scores: dict[str, float] = {}
+    evidence: dict[str, dict[str, int]] = {}
+
+    for profile in LANGUAGE_PROFILES:
+        score, profile_evidence = score_language_profile(normalized, tokens, profile)
+        scores[profile.code] = score
+        if profile_evidence:
+            evidence[profile.code] = profile_evidence
+
+    preferred_profile = profile_for_voice(preferred_voice) if preferred_voice else None
+    if preferred_profile is not None:
+        scores[preferred_profile.code] = scores.get(preferred_profile.code, 0.0) + VOICE_PRIOR_WEIGHT
+        evidence.setdefault(preferred_profile.code, {})["voice_prior"] = int(VOICE_PRIOR_WEIGHT * 10)
+
+    ranked = sorted(scores.items(), key=lambda item: (item[1], item[0] == DEFAULT_LANGUAGE_CODE, item[0]), reverse=True)
+    resolved_lang = ranked[0][0] if ranked else DEFAULT_LANGUAGE_CODE
+    best_score = ranked[0][1] if ranked else 0.0
+    runner_up_score = ranked[1][1] if len(ranked) > 1 else 0.0
+
+    if best_score <= 0:
+        fallback = preferred_profile.code if preferred_profile else DEFAULT_LANGUAGE_CODE
         return {
-            "lang": "en-us",
-            "reason": "No Han characters detected.",
-            "han_chars": han_chars,
-            "latin_letters": latin_letters,
-            "latin_words": latin_words,
+            "lang": fallback,
+            "reason": "No strong language cues detected; using the selected voice or English default.",
+            "scores": scores,
+            "evidence": evidence,
+            "preferred_voice_lang": preferred_profile.code if preferred_profile else None,
         }
 
-    if han_chars >= 2 and latin_letters == 0:
-        return {
-            "lang": "cmn",
-            "reason": "Only Han script detected.",
-            "han_chars": han_chars,
-            "latin_letters": latin_letters,
-            "latin_words": latin_words,
-        }
-
-    if han_chars >= 10 and han_chars >= int(latin_letters * 0.8):
-        return {
-            "lang": "cmn",
-            "reason": "Han script dominates or is at least comparable to Latin text.",
-            "han_chars": han_chars,
-            "latin_letters": latin_letters,
-            "latin_words": latin_words,
-        }
-
-    if han_chars >= 24:
-        return {
-            "lang": "cmn",
-            "reason": "Large Han-script span detected.",
-            "han_chars": han_chars,
-            "latin_letters": latin_letters,
-            "latin_words": latin_words,
-        }
+    if best_score - runner_up_score < 1.0 and preferred_profile is not None:
+        resolved_lang = preferred_profile.code
+        reason = "Language cues were weak; using the selected voice language."
+    else:
+        reason = f"Detected {resolved_lang} from text cues."
 
     return {
-        "lang": "en-us",
-        "reason": "Latin text dominates and Han script appears incidental.",
-        "han_chars": han_chars,
-        "latin_letters": latin_letters,
-        "latin_words": latin_words,
+        "lang": resolved_lang,
+        "reason": reason,
+        "scores": scores,
+        "evidence": evidence,
+        "preferred_voice_lang": preferred_profile.code if preferred_profile else None,
     }
 
 
@@ -605,57 +800,324 @@ def resolve_language_and_voice(
     requested_lang: str,
     requested_voice: str,
 ) -> tuple[str, str, dict[str, object]]:
-    if requested_lang != "auto":
-        return requested_lang, requested_voice, {
-            "mode": "manual",
-            "reason": f"Language forced via --lang {requested_lang}.",
-            "requested_lang": requested_lang,
-        }
+    normalized_requested_lang = normalize_language_code(requested_lang)
+    requested_voice_profile = profile_for_voice(requested_voice)
 
-    detection = detect_language(text)
+    if normalized_requested_lang != "auto":
+        resolved_lang = normalized_requested_lang
+        detection: dict[str, object] = {
+            "mode": "manual",
+            "reason": f"Language forced via --lang {resolved_lang}.",
+            "requested_lang": requested_lang,
+            "normalized_requested_lang": resolved_lang,
+            "requested_voice": requested_voice,
+            "preferred_voice_lang": requested_voice_profile.code if requested_voice_profile else None,
+        }
+        resolved_voice = requested_voice
+        target_voice = default_voice_for_language(resolved_lang)
+        if target_voice is not None:
+            target_profile = profile_for_language(resolved_lang)
+            if requested_voice_profile is None or requested_voice_profile.code != target_profile.code:
+                resolved_voice = target_voice
+                detection["voice_fallback"] = {
+                    "from": requested_voice,
+                    "to": resolved_voice,
+                    "reason": "Selected voice does not match the forced language.",
+                }
+        return resolved_lang, resolved_voice, detection
+
+    detection = detect_language(text, preferred_voice=requested_voice)
     resolved_lang = str(detection["lang"])
     resolved_voice = requested_voice
+    target_voice = default_voice_for_language(resolved_lang)
 
-    if resolved_lang == "cmn" and not is_mandarin_voice(requested_voice):
-        resolved_voice = DEFAULT_MANDARIN_VOICE
-        detection["voice_fallback"] = {
-            "from": requested_voice,
-            "to": resolved_voice,
-            "reason": "Mandarin text detected with a non-Mandarin voice.",
-        }
+    if target_voice is not None:
+        target_profile = profile_for_language(resolved_lang)
+        if requested_voice_profile is None or requested_voice_profile.code != target_profile.code:
+            resolved_voice = target_voice
+            detection["voice_fallback"] = {
+                "from": requested_voice,
+                "to": resolved_voice,
+                "reason": "Detected language does not match the selected voice.",
+            }
 
     detection["mode"] = "auto"
     detection["requested_lang"] = requested_lang
+    detection["requested_voice"] = requested_voice
     return resolved_lang, resolved_voice, detection
 
 
-def split_into_chunks(text: str, max_chars: int = DEFAULT_CHUNK_MAX_CHARS) -> list[str]:
+def split_text_on_delimiters(text: str, delimiters: str) -> list[str]:
+    units: list[str] = []
+    current: list[str] = []
+
+    for character in text:
+        current.append(character)
+        if character in delimiters:
+            unit = "".join(current).strip()
+            if unit:
+                units.append(unit)
+            current = []
+
+    if current:
+        unit = "".join(current).strip()
+        if unit:
+            units.append(unit)
+
+    return units
+
+
+def split_text_on_words(text: str) -> list[str]:
+    return re.findall(r"\S+", text)
+
+
+def phoneme_length(
+    text: str,
+    *,
+    tokenizer: object,
+    lang: str,
+    cache: dict[str, int],
+) -> int:
+    cached = cache.get(text)
+    if cached is not None:
+        return cached
+
+    length = len(tokenizer.phonemize(text, lang))
+    cache[text] = length
+    return length
+
+
+def chunk_fits(
+    text: str,
+    *,
+    max_chars: int,
+    max_phonemes: int,
+    tokenizer: object | None,
+    lang: str,
+    cache: dict[str, int],
+) -> bool:
+    if not text or len(text) > max_chars:
+        return False
+    if tokenizer is None:
+        return True
+    return phoneme_length(text, tokenizer=tokenizer, lang=lang, cache=cache) <= max_phonemes
+
+
+def split_oversized_fragment(
+    text: str,
+    *,
+    max_chars: int,
+    max_phonemes: int,
+    tokenizer: object | None,
+    lang: str,
+    cache: dict[str, int],
+) -> list[str]:
+    remaining = text.strip()
+    fragments: list[str] = []
+
+    while remaining:
+        upper_bound = min(len(remaining), max_chars)
+        lower_bound = 1
+        best_index = 0
+
+        while lower_bound <= upper_bound:
+            midpoint = (lower_bound + upper_bound) // 2
+            candidate = remaining[:midpoint].strip()
+            if candidate and chunk_fits(
+                candidate,
+                max_chars=max_chars,
+                max_phonemes=max_phonemes,
+                tokenizer=tokenizer,
+                lang=lang,
+                cache=cache,
+            ):
+                best_index = midpoint
+                lower_bound = midpoint + 1
+            else:
+                upper_bound = midpoint - 1
+
+        if best_index <= 0:
+            best_index = 1
+
+        min_break_index = max(int(best_index * 0.55), 1)
+        split_index = best_index
+        window = remaining[:best_index]
+        preferred_breaks = " \t\n-/,;:，、；："
+        for break_char in preferred_breaks:
+            break_at = window.rfind(break_char)
+            if break_at >= min_break_index:
+                split_index = break_at + 1
+                break
+
+        chunk = remaining[:split_index].strip()
+        if not chunk:
+            chunk = remaining[:best_index].strip()
+            split_index = max(best_index, 1)
+
+        fragments.append(chunk)
+        remaining = remaining[split_index:].strip()
+
+    return fragments
+
+
+def assemble_chunks_from_units(
+    units: list[str],
+    *,
+    max_chars: int,
+    max_phonemes: int,
+    tokenizer: object | None,
+    lang: str,
+    cache: dict[str, int],
+) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+
+    for unit in units:
+        piece = re.sub(r"\s+", " ", unit).strip()
+        if not piece:
+            continue
+
+        if not chunk_fits(
+            piece,
+            max_chars=max_chars,
+            max_phonemes=max_phonemes,
+            tokenizer=tokenizer,
+            lang=lang,
+            cache=cache,
+        ):
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(
+                split_into_chunks(
+                    piece,
+                    max_chars=max_chars,
+                    max_phonemes=max_phonemes,
+                    tokenizer=tokenizer,
+                    lang=lang,
+                    cache=cache,
+                )
+            )
+            continue
+
+        candidate = piece if not current else f"{current} {piece}"
+        if chunk_fits(
+            candidate,
+            max_chars=max_chars,
+            max_phonemes=max_phonemes,
+            tokenizer=tokenizer,
+            lang=lang,
+            cache=cache,
+        ):
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+        current = piece
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def split_into_chunks(
+    text: str,
+    max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
+    max_phonemes: int = DEFAULT_CHUNK_MAX_PHONEMES,
+    *,
+    tokenizer: object | None = None,
+    lang: str = "en-us",
+    cache: dict[str, int] | None = None,
+) -> list[str]:
     normalized = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not normalized:
         return []
 
+    chunk_cache = cache if cache is not None else {}
+    collapsed = re.sub(r"\s+", " ", normalized).strip()
+    if chunk_fits(
+        collapsed,
+        max_chars=max_chars,
+        max_phonemes=max_phonemes,
+        tokenizer=tokenizer,
+        lang=lang,
+        cache=chunk_cache,
+    ):
+        return [collapsed]
+
     paragraphs = [part.strip() for part in normalized.split("\n\n") if part.strip()]
     chunks: list[str] = []
-    soft_break_chars = ".!?。！？,;:，、；："
-    min_break_index = max(int(max_chars * 0.45), 1)
 
     for paragraph in paragraphs:
-        remaining = paragraph
-        while len(remaining) > max_chars:
-            window = remaining[: max_chars + 1]
-            split_at = max(window.rfind(char) for char in soft_break_chars)
-            if split_at < min_break_index:
-                whitespace_split = window.rfind(" ")
-                if whitespace_split >= min_break_index:
-                    split_at = whitespace_split
-            split_index = max_chars if split_at < min_break_index else split_at + 1
-            chunk = remaining[:split_index].strip()
-            if chunk:
-                chunks.append(chunk)
-            remaining = remaining[split_index:].strip()
+        paragraph_text = re.sub(r"\s+", " ", paragraph).strip()
+        if not paragraph_text:
+            continue
 
-        if remaining:
-            chunks.append(remaining)
+        if chunk_fits(
+            paragraph_text,
+            max_chars=max_chars,
+            max_phonemes=max_phonemes,
+            tokenizer=tokenizer,
+            lang=lang,
+            cache=chunk_cache,
+        ):
+            chunks.append(paragraph_text)
+            continue
+
+        sentence_units = split_text_on_delimiters(paragraph_text, ".!?。！？")
+        if len(sentence_units) > 1:
+            chunks.extend(
+                assemble_chunks_from_units(
+                    sentence_units,
+                    max_chars=max_chars,
+                    max_phonemes=max_phonemes,
+                    tokenizer=tokenizer,
+                    lang=lang,
+                    cache=chunk_cache,
+                )
+            )
+            continue
+
+        clause_units = split_text_on_delimiters(paragraph_text, ",;:，、；：")
+        if len(clause_units) > 1:
+            chunks.extend(
+                assemble_chunks_from_units(
+                    clause_units,
+                    max_chars=max_chars,
+                    max_phonemes=max_phonemes,
+                    tokenizer=tokenizer,
+                    lang=lang,
+                    cache=chunk_cache,
+                )
+            )
+            continue
+
+        word_units = split_text_on_words(paragraph_text)
+        if len(word_units) > 1:
+            chunks.extend(
+                assemble_chunks_from_units(
+                    word_units,
+                    max_chars=max_chars,
+                    max_phonemes=max_phonemes,
+                    tokenizer=tokenizer,
+                    lang=lang,
+                    cache=chunk_cache,
+                )
+            )
+            continue
+
+        chunks.extend(
+            split_oversized_fragment(
+                paragraph_text,
+                max_chars=max_chars,
+                max_phonemes=max_phonemes,
+                tokenizer=tokenizer,
+                lang=lang,
+                cache=chunk_cache,
+            )
+        )
 
     return chunks
 
@@ -685,7 +1147,7 @@ def synthesize(
     reporter: ProgressReporter | None = None,
 ) -> tuple[np.ndarray, int]:
     kokoro = build_kokoro()
-    chunks = split_into_chunks(text)
+    chunks = split_into_chunks(text, tokenizer=kokoro.tokenizer, lang=lang)
     if not chunks:
         raise RuntimeError("No text remained after chunking.")
 
@@ -887,7 +1349,7 @@ def make_voice_preview(args: argparse.Namespace, reporter: ProgressReporter) -> 
     for index, voice in enumerate(voices, start=1):
         reporter.emit("progress", current=index, total=len(voices), voice=voice, stage="preview_all_voices")
         prompt = preview_prompt_for_voice(voice, args.preview_text)
-        preview_lang = "cmn" if is_mandarin_voice(voice) and count_han_characters(args.preview_text) > 0 else "en-us"
+        preview_lang = preview_language_for_voice(voice, prompt)
         samples, current_rate = kokoro.create(prompt, voice=voice, speed=args.speed, lang=preview_lang)
         if sample_rate is None:
             sample_rate = current_rate
