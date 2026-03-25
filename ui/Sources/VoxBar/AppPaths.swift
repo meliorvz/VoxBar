@@ -27,6 +27,7 @@ enum AppPaths {
     static var historyFile: URL { supportRoot.appendingPathComponent("history.json") }
     static var runsRoot: URL { supportRoot.appendingPathComponent("Runs", isDirectory: true) }
     static var previewsRoot: URL { supportRoot.appendingPathComponent("Previews", isDirectory: true) }
+    static var inboxRoot: URL { supportRoot.appendingPathComponent("Inbox", isDirectory: true) }
     static var logsRoot: URL { supportRoot.appendingPathComponent("Logs", isDirectory: true) }
     static var appLogFile: URL { logsRoot.appendingPathComponent("voxbar.log") }
 
@@ -36,6 +37,7 @@ enum AppPaths {
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         try fm.createDirectory(at: runsRoot, withIntermediateDirectories: true)
         try fm.createDirectory(at: previewsRoot, withIntermediateDirectories: true)
+        try fm.createDirectory(at: inboxRoot, withIntermediateDirectories: true)
         try fm.createDirectory(at: logsRoot, withIntermediateDirectories: true)
     }
 

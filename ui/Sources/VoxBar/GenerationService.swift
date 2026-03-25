@@ -34,6 +34,7 @@ final class GenerationService {
         speed: Double,
         streamChunks: Bool = false,
         titleOverride: String? = nil,
+        disableMetadataTitle: Bool? = nil,
         onChunkReady: @escaping @MainActor (BufferedChunkReady) -> Void = { _ in },
         onProgress: @escaping @Sendable (GenerationProgress) -> Void
     ) async throws -> GenerationRunResult {
@@ -61,7 +62,8 @@ final class GenerationService {
             speed: speed,
             streamChunks: streamChunks,
             jobID: runID.uuidString,
-            title: title
+            title: title,
+            disableMetadataTitle: disableMetadataTitle
         )
 
         let result = try await bridge.run(
@@ -141,7 +143,8 @@ final class GenerationService {
         speed: Double,
         streamChunks: Bool,
         jobID: String,
-        title: String
+        title: String,
+        disableMetadataTitle: Bool?
     ) -> [String] {
         var arguments: [String] = [
             "--json-events",
@@ -152,6 +155,9 @@ final class GenerationService {
             "--output-dir", AppPaths.runsRoot.path,
             "--title", title
         ]
+        if disableMetadataTitle == true {
+            arguments.append("--no-metadata")
+        }
         if streamChunks {
             arguments.append("--stream-chunks")
         }

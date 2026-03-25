@@ -27,6 +27,8 @@ final class ArticleTTSViewModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private var pendingExternalTitleOverride: String?
+    private var pendingExternalDisableMetadataTitle: Bool?
 
     init() {
         inputText = defaults.string(forKey: "lastInput") ?? ""
@@ -100,9 +102,11 @@ final class ArticleTTSViewModel: ObservableObject {
 
         isGenerating = true
         let sourceKind: InputSourceKind = trimmed.looksLikeURL ? .url : .text
+        let titleOverride = pendingExternalTitleOverride
+        let disableMetadataTitle = pendingExternalDisableMetadataTitle
         if playWhileBufferingEnabled {
             playback.beginBufferedPlayback(
-                title: provisionalTitle(for: trimmed, kind: sourceKind),
+                title: titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? provisionalTitle(for: trimmed, kind: sourceKind),
                 subtitle: bufferedPlaybackSubtitle(for: sourceKind)
             )
         }
@@ -123,6 +127,8 @@ final class ArticleTTSViewModel: ObservableObject {
                     voice: selectedVoice,
                     speed: selectedSpeed,
                     streamChunks: playWhileBufferingEnabled,
+                    titleOverride: titleOverride,
+                    disableMetadataTitle: disableMetadataTitle,
                     onChunkReady: { [weak self] chunk in
                         self?.playback.appendBufferedChunk(url: chunk.url, duration: chunk.duration)
                     }
@@ -156,6 +162,8 @@ final class ArticleTTSViewModel: ObservableObject {
                         "audio_path": result.record.audioURL.path,
                     ]
                 )
+                pendingExternalTitleOverride = nil
+                pendingExternalDisableMetadataTitle = nil
             } catch {
                 progress.phase = .failed
                 progress.message = "Generation failed"
@@ -171,9 +179,35 @@ final class ArticleTTSViewModel: ObservableObject {
                         "source_kind": trimmed.looksLikeURL ? "url" : "text",
                     ]
                 )
+                pendingExternalTitleOverride = nil
+                pendingExternalDisableMetadataTitle = nil
             }
             isGenerating = false
         }
+    }
+
+    func handleExternalInput(
+        _ value: String,
+        titleOverride: String? = nil,
+        disableMetadataTitle: Bool? = nil,
+        autoGenerate: Bool
+    ) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        inputText = trimmed
+        pendingExternalTitleOverride = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        pendingExternalDisableMetadataTitle = disableMetadataTitle
+        progress.lastError = nil
+
+        guard autoGenerate else { return }
+        guard !isGenerating else {
+            progress.message = "Generation already running"
+            progress.detail = "The new input was loaded into VoxBar. Start it after the current job finishes."
+            return
+        }
+
+        generate()
     }
 
     func delete(_ record: GenerationRecord) {
@@ -366,5 +400,9 @@ final class ArticleTTSViewModel: ObservableObject {
 private extension String {
     var looksLikeURL: Bool {
         lowercased().hasPrefix("http://") || lowercased().hasPrefix("https://")
+    }
+
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
