@@ -71,6 +71,17 @@ enum VoiceGender: String {
     case male
     case unknown
 
+    var displayName: String {
+        switch self {
+        case .female:
+            return "Female"
+        case .male:
+            return "Male"
+        case .unknown:
+            return "Unknown"
+        }
+    }
+
     var shortLabel: String {
         switch self {
         case .female:
@@ -90,6 +101,56 @@ enum VoiceGender: String {
             return "person.crop.circle"
         case .unknown:
             return "person.crop.circle.dashed"
+        }
+    }
+
+    var sortOrder: Int {
+        switch self {
+        case .female:
+            return 0
+        case .male:
+            return 1
+        case .unknown:
+            return 2
+        }
+    }
+}
+
+enum VoiceFilter: Hashable {
+    case all
+    case gender(VoiceGender)
+    case country(String)
+
+    var title: String {
+        switch self {
+        case .all:
+            return "All"
+        case .gender(let gender):
+            return gender.displayName
+        case .country(let code):
+            return code
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .all:
+            return "line.3.horizontal.decrease.circle"
+        case .gender(let gender):
+            return gender.symbolName
+        case .country:
+            return "globe"
+        }
+    }
+
+    func matches(_ profile: VoiceProfile) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .gender(let gender):
+            return profile.gender == gender
+        case .country(let code):
+            return profile.regionCode == code
         }
     }
 }
@@ -158,5 +219,9 @@ struct VoiceProfile: Identifiable, Hashable {
             regionCode = "--"
             languageLabel = "Unknown"
         }
+    }
+
+    var countrySortKey: String {
+        regionCode == "--" ? "ZZ" : regionCode
     }
 }

@@ -7,6 +7,7 @@ struct ContentView: View {
 
     @State private var showDetails = false
     @State private var showVoicePalette = false
+    @State private var selectedVoiceFilter: VoiceFilter = .all
     @State private var isSourceExpanded = true
     @State private var isSettingsExpanded = false
     @State private var isRecentExpanded = false
@@ -342,7 +343,7 @@ struct ContentView: View {
 
     private var voicePalette: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .top, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Choose Voice")
                         .font(.system(size: 12, weight: .bold))
@@ -354,9 +355,19 @@ struct ContentView: View {
                 }
 
                 Spacer()
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(voiceFilterOptions, id: \.self) { filter in
+                            voiceFilterChip(filter)
+                        }
+                    }
+                    .padding(.vertical, 1)
+                }
+                .frame(maxWidth: 228, alignment: .trailing)
             }
 
-            if !viewModel.favoriteSettings.isEmpty {
+            if !filteredFavoriteSettings.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Starred")
                         .font(.system(size: 11, weight: .bold))
@@ -364,24 +375,29 @@ struct ContentView: View {
                         .textCase(.uppercase)
 
                     LazyVStack(spacing: 6) {
-                        ForEach(viewModel.favoriteSettings.prefix(ArticleTTSViewModel.maxFavoriteSettings)) { favorite in
+                        ForEach(filteredFavoriteSettings.prefix(ArticleTTSViewModel.maxFavoriteSettings)) { favorite in
                             favoriteSettingRow(favorite)
                         }
                     }
                 }
             }
 
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVStack(spacing: 6) {
-                    ForEach(voiceProfiles, id: \.id) { profile in
-                        voiceRow(profile)
+            if filteredVoiceProfiles.isEmpty {
+                emptyVoiceState
+            } else {
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(spacing: 6) {
+                        ForEach(filteredVoiceProfiles, id: \.id) { profile in
+                            voiceRow(profile)
+                        }
                     }
+                    .padding(.trailing, 4)
                 }
-                .padding(.trailing, 4)
+                .frame(width: 348, height: 248)
             }
-            .frame(width: 334, height: 248)
         }
         .padding(12)
+        .frame(width: 372)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color(red: 0.97, green: 0.95, blue: 0.92).opacity(0.98))
@@ -444,7 +460,7 @@ struct ContentView: View {
                 showVoicePalette = false
             } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: profile.gender.symbolName)
+                    Image(systemName: profile.id == viewModel.selectedVoice ? "checkmark.circle.fill" : profile.gender.symbolName)
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(accent)
                         .frame(width: 22)
@@ -461,12 +477,6 @@ struct ContentView: View {
                     Spacer()
 
                     VoiceChip(profile: profile)
-
-                    if profile.id == viewModel.selectedVoice {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(accent)
-                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
@@ -495,6 +505,52 @@ struct ContentView: View {
             .buttonStyle(UtilityIconButtonStyle())
             .disabled(viewModel.previewingVoiceID != nil && viewModel.previewingVoiceID != profile.id)
         }
+    }
+
+    private func voiceFilterChip(_ filter: VoiceFilter) -> some View {
+        let isSelected = filter == selectedVoiceFilter
+
+        return Button {
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.92)) {
+                selectedVoiceFilter = filter
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: filter.symbolName)
+                    .font(.system(size: 9.5, weight: .bold))
+                Text(filter.title)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(isSelected ? ink : mutedInk)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(isSelected ? accent.opacity(0.18) : Color.white.opacity(0.52))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(isSelected ? accent.opacity(0.35) : Color.white.opacity(0.62), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(filter.title)
+    }
+
+    private var emptyVoiceState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("No voices match this filter")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(ink)
+            Button("Clear Filter") {
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.92)) {
+                    selectedVoiceFilter = .all
+                }
+            }
+            .buttonStyle(TextActionButtonStyle())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 10)
     }
 
     private var inlineStatus: some View {
@@ -875,7 +931,40 @@ struct ContentView: View {
 
     private var voiceProfiles: [VoiceProfile] {
         let source = viewModel.availableVoices.isEmpty ? [viewModel.selectedVoice] : viewModel.availableVoices
-        return source.map { VoiceProfile(id: $0) }.sorted { $0.displayName < $1.displayName }
+        return source.map { VoiceProfile(id: $0) }.sorted { lhs, rhs in
+            if lhs.countrySortKey != rhs.countrySortKey {
+                return lhs.countrySortKey < rhs.countrySortKey
+            }
+            if lhs.gender.sortOrder != rhs.gender.sortOrder {
+                return lhs.gender.sortOrder < rhs.gender.sortOrder
+            }
+
+            let nameComparison = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+            if nameComparison != .orderedSame {
+                return nameComparison == .orderedAscending
+            }
+
+            return lhs.id.localizedCaseInsensitiveCompare(rhs.id) == .orderedAscending
+        }
+    }
+
+    private var filteredVoiceProfiles: [VoiceProfile] {
+        voiceProfiles.filter { selectedVoiceFilter.matches($0) }
+    }
+
+    private var filteredFavoriteSettings: [FavoriteVoiceSetting] {
+        viewModel.favoriteSettings.filter { selectedVoiceFilter.matches(VoiceProfile(id: $0.voice)) }
+    }
+
+    private var voiceFilterOptions: [VoiceFilter] {
+        var options: [VoiceFilter] = [.all, .gender(.female), .gender(.male)]
+        if voiceProfiles.contains(where: { $0.gender == .unknown }) {
+            options.append(.gender(.unknown))
+        }
+
+        let countries = Set(voiceProfiles.map(\.regionCode).filter { $0 != "--" }).sorted()
+        options.append(contentsOf: countries.map(VoiceFilter.country))
+        return options
     }
 
     private var editorHeight: CGFloat {
