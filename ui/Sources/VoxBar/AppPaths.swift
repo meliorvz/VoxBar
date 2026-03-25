@@ -27,6 +27,8 @@ enum AppPaths {
     static var historyFile: URL { supportRoot.appendingPathComponent("history.json") }
     static var runsRoot: URL { supportRoot.appendingPathComponent("Runs", isDirectory: true) }
     static var previewsRoot: URL { supportRoot.appendingPathComponent("Previews", isDirectory: true) }
+    static var logsRoot: URL { supportRoot.appendingPathComponent("Logs", isDirectory: true) }
+    static var appLogFile: URL { logsRoot.appendingPathComponent("voxbar.log") }
 
     static func ensureDirectories() throws {
         let root = supportRoot
@@ -34,6 +36,7 @@ enum AppPaths {
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         try fm.createDirectory(at: runsRoot, withIntermediateDirectories: true)
         try fm.createDirectory(at: previewsRoot, withIntermediateDirectories: true)
+        try fm.createDirectory(at: logsRoot, withIntermediateDirectories: true)
     }
 
     private static func migrateLegacySupportRootIfNeeded(from legacyRoot: URL, to currentRoot: URL) {
@@ -45,7 +48,14 @@ enum AppPaths {
         do {
             try fm.moveItem(at: legacyRoot, to: currentRoot)
         } catch {
-            print("Failed to migrate legacy support directory: \(error)")
+            AppLogger.error(
+                "Support directory migration failed",
+                metadata: [
+                    "legacy_root": legacyRoot.path,
+                    "current_root": currentRoot.path,
+                    "error": error.localizedDescription,
+                ]
+            )
         }
     }
 }

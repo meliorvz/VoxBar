@@ -6,6 +6,14 @@ struct GenerationRunResult {
     let stderr: String
 }
 
+struct BufferedChunkReady: Sendable {
+    let current: Int
+    let total: Int
+    let url: URL
+    let duration: TimeInterval
+    let bufferedSeconds: TimeInterval
+}
+
 final class GenerationService {
     private let bridge = ProcessBridge()
     private static let previewPhrase = "The quick brown fox jumps over the lazy dog."
@@ -24,7 +32,9 @@ final class GenerationService {
         sourceKind: InputSourceKind,
         voice: String,
         speed: Double,
+        streamChunks: Bool = false,
         titleOverride: String? = nil,
+        onChunkReady: @escaping @MainActor (BufferedChunkReady) -> Void = { _ in },
         onProgress: @escaping @Sendable (GenerationProgress) -> Void
     ) async throws -> GenerationRunResult {
         try AppPaths.ensureDirectories()
@@ -49,6 +59,7 @@ final class GenerationService {
             sourceKind: sourceKind,
             voice: voice,
             speed: speed,
+            streamChunks: streamChunks,
             jobID: runID.uuidString,
             title: title
         )
@@ -61,6 +72,9 @@ final class GenerationService {
                     relay.value.logLines = Self.append(line: line, to: relay.value.logLines)
                     if let event = Self.decodeEvent(from: line) {
                         Self.apply(event: event, to: &relay.value)
+                        if let chunkReady = Self.decodeChunkReady(from: event) {
+                            onChunkReady(chunkReady)
+                        }
                     }
                     onProgress(relay.value)
                 }
@@ -68,7 +82,9 @@ final class GenerationService {
             onStderrLine: { line in
                 Task { @MainActor in
                     relay.value.logLines = Self.append(line: "stderr: \(line)", to: relay.value.logLines)
-                    relay.value.lastError = line
+                    if !Self.isNonFatalStderr(line) {
+                        relay.value.lastError = line
+                    }
                     onProgress(relay.value)
                 }
             }
@@ -123,6 +139,7 @@ final class GenerationService {
         sourceKind: InputSourceKind,
         voice: String,
         speed: Double,
+        streamChunks: Bool,
         jobID: String,
         title: String
     ) -> [String] {
@@ -135,6 +152,9 @@ final class GenerationService {
             "--output-dir", AppPaths.runsRoot.path,
             "--title", title
         ]
+        if streamChunks {
+            arguments.append("--stream-chunks")
+        }
         if sourceKind == .url {
             arguments.append(inputValue)
         } else {
@@ -202,6 +222,20 @@ final class GenerationService {
                 progress.message = "Rendering audio"
             }
             progress.detail = event.stage ?? "Kokoro is synthesizing the audio."
+        case "chunk_ready":
+            progress.phase = .rendering
+            progress.chunkIndex = event.current
+            progress.chunkTotal = event.total
+            if let current = event.current, let total = event.total {
+                progress.message = "Buffered chunk \(current)/\(total)"
+            } else {
+                progress.message = "Buffering audio"
+            }
+            if let bufferedSeconds = event.bufferedSeconds {
+                progress.detail = "Buffered \(format(seconds: bufferedSeconds)) for early playback."
+            } else {
+                progress.detail = "A playable chunk is ready."
+            }
         case "result":
             progress.phase = .ready
             progress.message = "Ready"
@@ -236,6 +270,12 @@ final class GenerationService {
         }
 
         if let lastError, lastResult == nil {
+            AppLogger.error(
+                "Bridge returned error event without result",
+                metadata: [
+                    "message": lastError.message ?? "The bridge reported an error.",
+                ]
+            )
             throw BridgeError.malformedOutput(lastError.message ?? "The bridge reported an error.")
         }
 
@@ -246,6 +286,12 @@ final class GenerationService {
             let textPath = result.textPath,
             let audioPath = result.audioPath
         else {
+            AppLogger.error(
+                "Bridge returned malformed output",
+                metadata: [
+                    "stdout_tail": String(stdout.suffix(400)),
+                ]
+            )
             throw BridgeError.malformedOutput("The bridge did not return the generated file paths.")
         }
 
@@ -285,6 +331,31 @@ final class GenerationService {
         let remainder = seconds - (Double(minutes) * 60)
         return "\(minutes)m \(String(format: "%.1fs", remainder))"
     }
+
+    private static func decodeChunkReady(from event: BridgeEvent) -> BufferedChunkReady? {
+        guard
+            event.type == "chunk_ready",
+            let current = event.current,
+            let total = event.total,
+            let chunkPath = event.chunkPath,
+            let chunkSeconds = event.chunkSeconds
+        else {
+            return nil
+        }
+
+        return BufferedChunkReady(
+            current: current,
+            total: total,
+            url: URL(fileURLWithPath: chunkPath),
+            duration: chunkSeconds,
+            bufferedSeconds: event.bufferedSeconds ?? chunkSeconds
+        )
+    }
+
+    private static func isNonFatalStderr(_ line: String) -> Bool {
+        let normalized = line.lowercased()
+        return normalized.contains("warning") || normalized.contains("truncating to 510 phonemes")
+    }
 }
 
 @MainActor
@@ -306,6 +377,10 @@ private struct BridgeEvent: Decodable {
     let title: String?
     let jobDir: String?
     let manifestPath: String?
+    let chunksDir: String?
+    let chunkPath: String?
+    let chunkSeconds: Double?
+    let bufferedSeconds: Double?
     let textPath: String?
     let audioPath: String?
     let metadataSummary: String?
@@ -325,6 +400,10 @@ private struct BridgeEvent: Decodable {
         case title
         case jobDir = "job_dir"
         case manifestPath = "manifest_path"
+        case chunksDir = "chunks_dir"
+        case chunkPath = "chunk_path"
+        case chunkSeconds = "chunk_seconds"
+        case bufferedSeconds = "buffered_seconds"
         case textPath = "text_path"
         case audioPath = "audio_path"
         case metadataSummary = "metadata_summary"

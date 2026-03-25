@@ -11,6 +11,7 @@ final class ArticleTTSViewModel: ObservableObject {
     @Published var inputText: String
     @Published var selectedVoice: String
     @Published var selectedSpeed: Double
+    @Published var playWhileBufferingEnabled: Bool
     @Published var favoriteSettings: [FavoriteVoiceSetting]
     @Published var availableVoices: [String] = []
     @Published var isLoadingVoices = false
@@ -32,6 +33,7 @@ final class ArticleTTSViewModel: ObservableObject {
         let savedVoice = defaults.string(forKey: "defaultVoice")
         let savedSpeed = defaults.object(forKey: "defaultSpeed") as? Double ?? 1.0
         selectedSpeed = Self.normalizedSpeed(savedSpeed)
+        playWhileBufferingEnabled = defaults.object(forKey: "playWhileBufferingEnabled") as? Bool ?? false
         if let data = defaults.data(forKey: "favoriteVoiceSettings"),
            let decoded = try? decoder.decode([FavoriteVoiceSetting].self, from: data) {
             favoriteSettings = decoded
@@ -73,10 +75,12 @@ final class ArticleTTSViewModel: ObservableObject {
                     selectedVoice = first
                     defaults.set(first, forKey: "defaultVoice")
                 }
+                AppLogger.info("Voices loaded", metadata: ["count": String(voices.count)])
             } catch {
                 progress.lastError = error.localizedDescription
                 progress.message = "Voice load failed"
                 progress.detail = error.localizedDescription
+                AppLogger.error("Voice load failed", metadata: ["error": error.localizedDescription])
             }
             isLoadingVoices = false
         }
@@ -92,12 +96,22 @@ final class ArticleTTSViewModel: ObservableObject {
         defaults.set(trimmed, forKey: "lastInput")
         defaults.set(selectedVoice, forKey: "defaultVoice")
         defaults.set(selectedSpeed, forKey: "defaultSpeed")
+        defaults.set(playWhileBufferingEnabled, forKey: "playWhileBufferingEnabled")
 
         isGenerating = true
+        let sourceKind: InputSourceKind = trimmed.looksLikeURL ? .url : .text
+        if playWhileBufferingEnabled {
+            playback.beginBufferedPlayback(
+                title: provisionalTitle(for: trimmed, kind: sourceKind),
+                subtitle: bufferedPlaybackSubtitle(for: sourceKind)
+            )
+        }
         progress = GenerationProgress(
             phase: .fetching,
             message: trimmed.looksLikeURL ? "Fetching article" : "Preparing text",
-            detail: trimmed.looksLikeURL ? "Downloading and extracting the main article body." : "Rendering the pasted text directly."
+            detail: trimmed.looksLikeURL
+                ? "Downloading and extracting the main article body."
+                : "Rendering the pasted text directly."
         )
 
         Task {
@@ -105,9 +119,13 @@ final class ArticleTTSViewModel: ObservableObject {
             do {
                 let result = try await service.generate(
                     inputValue: trimmed,
-                    sourceKind: trimmed.looksLikeURL ? .url : .text,
+                    sourceKind: sourceKind,
                     voice: selectedVoice,
-                    speed: selectedSpeed
+                    speed: selectedSpeed,
+                    streamChunks: playWhileBufferingEnabled,
+                    onChunkReady: { [weak self] chunk in
+                        self?.playback.appendBufferedChunk(url: chunk.url, duration: chunk.duration)
+                    }
                 ) { [weak self] update in
                     Task { @MainActor in
                         self?.progress = update
@@ -116,15 +134,43 @@ final class ArticleTTSViewModel: ObservableObject {
 
                 history.insert(result.record, at: 0)
                 historyStore.save(history)
-                play(result.record)
+                selectedRecordID = result.record.id
+                let handledBufferedPlayback = playWhileBufferingEnabled && playback.completeBufferedPlayback(
+                    finalURL: result.record.audioURL,
+                    title: result.record.title,
+                    subtitle: playbackSubtitle(for: result.record)
+                )
+                if !handledBufferedPlayback {
+                    play(result.record)
+                }
                 progress.phase = .ready
                 progress.message = "Ready"
-                progress.detail = "Saved and playing \(result.record.audioURL.lastPathComponent)"
+                progress.detail = handledBufferedPlayback
+                    ? "Saved \(result.record.audioURL.lastPathComponent) and continued buffered playback."
+                    : "Saved and playing \(result.record.audioURL.lastPathComponent)"
+                AppLogger.info(
+                    "Generation completed",
+                    metadata: [
+                        "job_id": result.record.id.uuidString,
+                        "title": result.record.title,
+                        "audio_path": result.record.audioURL.path,
+                    ]
+                )
             } catch {
                 progress.phase = .failed
                 progress.message = "Generation failed"
                 progress.detail = error.localizedDescription
                 progress.lastError = error.localizedDescription
+                if playWhileBufferingEnabled {
+                    playback.abortBufferedPlayback(error: error.localizedDescription)
+                }
+                AppLogger.error(
+                    "Generation failed",
+                    metadata: [
+                        "error": error.localizedDescription,
+                        "source_kind": trimmed.looksLikeURL ? "url" : "text",
+                    ]
+                )
             }
             isGenerating = false
         }
@@ -191,6 +237,11 @@ final class ArticleTTSViewModel: ObservableObject {
         defaults.set(selectedSpeed, forKey: "defaultSpeed")
     }
 
+    func setPlayWhileBufferingEnabled(_ enabled: Bool) {
+        playWhileBufferingEnabled = enabled
+        defaults.set(enabled, forKey: "playWhileBufferingEnabled")
+    }
+
     func applyFavorite(_ favorite: FavoriteVoiceSetting) {
         setSelectedVoice(favorite.voice)
         setSelectedSpeed(favorite.speed)
@@ -244,6 +295,14 @@ final class ArticleTTSViewModel: ObservableObject {
                 progress.message = "Voice preview failed"
                 progress.detail = error.localizedDescription
                 progress.lastError = error.localizedDescription
+                AppLogger.error(
+                    "Voice preview failed",
+                    metadata: [
+                        "voice": voice,
+                        "speed": Self.speedLabel(for: selectedSpeed),
+                        "error": error.localizedDescription,
+                    ]
+                )
             }
             previewingVoiceID = nil
         }
@@ -279,6 +338,22 @@ final class ArticleTTSViewModel: ObservableObject {
         let profile = VoiceProfile(id: record.voice)
         let sourceLabel = record.sourceKind == .url ? "Link" : "Text"
         return "\(profile.displayName) • \(sourceLabel)"
+    }
+
+    private func bufferedPlaybackSubtitle(for sourceKind: InputSourceKind) -> String {
+        let profile = VoiceProfile(id: selectedVoice)
+        let sourceLabel = sourceKind == .url ? "Link" : "Text"
+        return "\(profile.displayName) • \(sourceLabel)"
+    }
+
+    private func provisionalTitle(for input: String, kind: InputSourceKind) -> String {
+        if kind == .url {
+            return URL(string: input)?.host ?? "article"
+        }
+
+        let words = input.split(whereSeparator: { $0.isWhitespace }).prefix(6).map(String.init)
+        let title = words.joined(separator: " ")
+        return title.isEmpty ? "pasted-text" : title
     }
 
     private func persistFavoriteSettings() {

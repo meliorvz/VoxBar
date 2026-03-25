@@ -51,6 +51,14 @@ final class ProcessBridge {
                 if process.terminationStatus == 0 {
                     continuation.resume(returning: result)
                 } else {
+                    AppLogger.error(
+                        "Bridge process failed",
+                        metadata: [
+                            "command": executableURL.path,
+                            "exit_code": String(process.terminationStatus),
+                            "stderr": result.stderr.trimmingCharacters(in: .whitespacesAndNewlines),
+                        ]
+                    )
                     continuation.resume(throwing: BridgeError.processFailed(result))
                 }
             }
@@ -58,6 +66,13 @@ final class ProcessBridge {
             do {
                 try process.run()
             } catch {
+                AppLogger.error(
+                    "Bridge process failed to start",
+                    metadata: [
+                        "command": executableURL.path,
+                        "error": error.localizedDescription,
+                    ]
+                )
                 continuation.resume(throwing: error)
             }
         }

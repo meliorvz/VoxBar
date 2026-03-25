@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 import warnings
 from datetime import datetime
@@ -43,6 +44,7 @@ DEFAULT_METADATA_CONTEXT = 4096
 DEFAULT_METADATA_TTL = 90
 DEFAULT_LMS_BIN = os.getenv("ARTICLE_TTS_LMS_BIN", "lms")
 DEFAULT_METADATA_TIMEOUT = 30.0
+DEFAULT_CHUNK_MAX_CHARS = 420
 METADATA_SYSTEM_PROMPT = """You create short descriptive metadata for articles and pasted text.
 
 Return only JSON matching the provided schema.
@@ -126,6 +128,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-events", action="store_true", help="Emit machine-readable NDJSON events")
     parser.add_argument("--json-progress", action="store_true", help="Deprecated alias for --json-events")
     parser.add_argument("--job-id", help="Stable job id used for output/jobs/<job-id>")
+    parser.add_argument(
+        "--stream-chunks",
+        action="store_true",
+        help="Write per-chunk wav files and emit chunk-ready events for progressive playback",
+    )
     parser.add_argument(
         "--preview-all-voices",
         action="store_true",
@@ -622,44 +629,33 @@ def resolve_language_and_voice(
     return resolved_lang, resolved_voice, detection
 
 
-def split_into_chunks(text: str, max_chars: int = 900) -> list[str]:
-    paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
+def split_into_chunks(text: str, max_chars: int = DEFAULT_CHUNK_MAX_CHARS) -> list[str]:
+    normalized = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not normalized:
+        return []
+
+    paragraphs = [part.strip() for part in normalized.split("\n\n") if part.strip()]
     chunks: list[str] = []
+    soft_break_chars = ".!?。！？,;:，、；："
+    min_break_index = max(int(max_chars * 0.45), 1)
 
     for paragraph in paragraphs:
-        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
-        current = ""
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
+        remaining = paragraph
+        while len(remaining) > max_chars:
+            window = remaining[: max_chars + 1]
+            split_at = max(window.rfind(char) for char in soft_break_chars)
+            if split_at < min_break_index:
+                whitespace_split = window.rfind(" ")
+                if whitespace_split >= min_break_index:
+                    split_at = whitespace_split
+            split_index = max_chars if split_at < min_break_index else split_at + 1
+            chunk = remaining[:split_index].strip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[split_index:].strip()
 
-            if len(sentence) > max_chars:
-                words = sentence.split()
-                overflow = ""
-                for word in words:
-                    candidate = f"{overflow} {word}".strip()
-                    if overflow and len(candidate) > max_chars:
-                        chunks.append(overflow)
-                        overflow = word
-                    else:
-                        overflow = candidate
-                if overflow:
-                    if current:
-                        chunks.append(current)
-                        current = ""
-                    chunks.append(overflow)
-                continue
-
-            candidate = f"{current} {sentence}".strip()
-            if current and len(candidate) > max_chars:
-                chunks.append(current)
-                current = sentence
-            else:
-                current = candidate
-
-        if current:
-            chunks.append(current)
+        if remaining:
+            chunks.append(remaining)
 
     return chunks
 
@@ -685,6 +681,7 @@ def synthesize(
     voice: str,
     lang: str,
     speed: float,
+    chunk_output_dir: Path | None = None,
     reporter: ProgressReporter | None = None,
 ) -> tuple[np.ndarray, int]:
     kokoro = build_kokoro()
@@ -694,6 +691,10 @@ def synthesize(
 
     rendered: list[np.ndarray] = []
     sample_rate: int | None = None
+    buffered_seconds = 0.0
+
+    if chunk_output_dir is not None:
+        chunk_output_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(chunks)
     if reporter:
@@ -712,8 +713,27 @@ def synthesize(
             raise RuntimeError(
                 f"Unexpected sample-rate change: {sample_rate} vs {current_rate}"
             )
-        rendered.append(samples)
-        rendered.append(np.zeros(int(current_rate * 0.18), dtype=np.float32))
+        if index < total:
+            silence = np.zeros(int(current_rate * 0.18), dtype=np.float32)
+            chunk_audio = np.concatenate((samples, silence))
+        else:
+            chunk_audio = samples
+        rendered.append(chunk_audio)
+        buffered_seconds += len(chunk_audio) / current_rate
+
+        if chunk_output_dir is not None:
+            chunk_path = chunk_output_dir / f"{index:04d}.wav"
+            sf.write(chunk_path, chunk_audio, current_rate)
+            if reporter:
+                reporter.emit(
+                    "chunk_ready",
+                    current=index,
+                    total=total,
+                    chunk_path=str(chunk_path),
+                    chunk_seconds=round(len(chunk_audio) / current_rate, 3),
+                    buffered_seconds=round(buffered_seconds, 3),
+                    sample_rate=current_rate,
+                )
 
     if sample_rate is None:
         raise RuntimeError("Kokoro did not return audio.")
@@ -752,6 +772,7 @@ def ensure_job_paths(output_dir: Path, job_id: str) -> dict[str, Path]:
     job_dir.mkdir(parents=True, exist_ok=True)
     return {
         "job_dir": job_dir,
+        "chunks_dir": job_dir / "chunks",
         "manifest_path": job_dir / "manifest.json",
         "input_path": job_dir / "input.txt",
         "text_path": job_dir / "cleaned.txt",
@@ -762,6 +783,21 @@ def ensure_job_paths(output_dir: Path, job_id: str) -> dict[str, Path]:
 
 def write_manifest(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def write_error_details(path: Path, exc: Exception, *, job_id: str, title: str, source_kind: str) -> None:
+    timestamp = datetime.now().isoformat()
+    payload = (
+        f"timestamp: {timestamp}\n"
+        f"job_id: {job_id}\n"
+        f"title: {title}\n"
+        f"source_kind: {source_kind}\n"
+        f"error_type: {type(exc).__name__}\n"
+        f"error: {exc}\n\n"
+        "traceback:\n"
+        f"{traceback.format_exc()}"
+    )
+    path.write_text(payload, encoding="utf-8")
 
 
 def looks_like_url(value: str) -> bool:
@@ -1016,7 +1052,14 @@ def main() -> int:
             metadata_executor = None
 
         synth_start = time.perf_counter()
-        audio, sample_rate = synthesize(article_text, resolved_voice, resolved_lang, args.speed, reporter=reporter)
+        audio, sample_rate = synthesize(
+            article_text,
+            resolved_voice,
+            resolved_lang,
+            args.speed,
+            chunk_output_dir=job_paths["chunks_dir"] if args.stream_chunks else None,
+            reporter=reporter,
+        )
         synth_elapsed = time.perf_counter() - synth_start
 
         final_title = title
@@ -1057,6 +1100,7 @@ def main() -> int:
             "metadata_tags": metadata_tags,
             "metadata_model": metadata_model_used,
             "job_dir": str(job_paths["job_dir"]),
+            "chunks_dir": str(job_paths["chunks_dir"]) if args.stream_chunks else "",
             "input_path": str(job_paths["input_path"]),
             "text_path": str(artifact_paths["text_path"]),
             "audio_path": str(artifact_paths["audio_path"]),
@@ -1078,6 +1122,7 @@ def main() -> int:
                 title=final_title,
                 job_dir=str(job_paths["job_dir"]),
                 manifest_path=str(manifest_path),
+                chunks_dir=str(job_paths["chunks_dir"]) if args.stream_chunks else None,
                 text_path=str(artifact_paths["text_path"]),
                 audio_path=str(artifact_paths["audio_path"]),
                 voice=resolved_voice,
@@ -1108,7 +1153,13 @@ def main() -> int:
         return 0
     except Exception as exc:
         total_elapsed = time.perf_counter() - total_start
-        job_paths["error_path"].write_text(str(exc) + "\n", encoding="utf-8")
+        write_error_details(
+            job_paths["error_path"],
+            exc,
+            job_id=job_id,
+            title=title,
+            source_kind=source_kind,
+        )
         write_manifest(
             manifest_path,
             {
@@ -1128,6 +1179,7 @@ def main() -> int:
                 "metadata_tags": metadata_tags,
                 "metadata_model": metadata_model_used,
                 "job_dir": str(job_paths["job_dir"]),
+                "chunks_dir": str(job_paths["chunks_dir"]) if args.stream_chunks else "",
                 "input_path": str(job_paths["input_path"]),
                 "text_path": str(job_paths["text_path"]),
                 "audio_path": str(job_paths["audio_path"]),
@@ -1145,6 +1197,7 @@ def main() -> int:
             "error",
             job_id=job_id,
             manifest_path=str(manifest_path),
+            chunks_dir=str(job_paths["chunks_dir"]) if args.stream_chunks else None,
             error_path=str(job_paths["error_path"]),
             message=str(exc),
         )

@@ -145,3 +145,5 @@ You can add `VoxBar.app` to macOS login items if you want it to launch at sign-i
 - Kokoro only works when generating audio
 - the metadata model is loaded on demand by the backend and then unloaded again
 - existing app support data migrates from `ArticleTTSBar` to `VoxBar` on first launch after the rename
+- app logs are written under `~/Library/Application Support/VoxBar/Logs/voxbar.log`
+- failed backend jobs write a detailed `error.txt` inside their job folder

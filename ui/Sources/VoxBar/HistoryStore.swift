@@ -27,7 +27,13 @@ final class HistoryStore {
             let data = try encoder.encode(records)
             try data.write(to: AppPaths.historyFile, options: .atomic)
         } catch {
-            print("Failed to save history: \(error)")
+            AppLogger.error(
+                "History save failed",
+                metadata: [
+                    "path": AppPaths.historyFile.path,
+                    "error": error.localizedDescription,
+                ]
+            )
         }
     }
 

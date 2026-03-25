@@ -6,6 +6,7 @@ APP_DIR="$ROOT_DIR/dist/VoxBar.app"
 BUILD_DIR="$ROOT_DIR/.build/release"
 
 cd "$ROOT_DIR"
+swift package clean >/dev/null 2>&1 || true
 swift build -c release
 
 rm -rf "$ROOT_DIR/dist/ArticleTTSBar.app" "$APP_DIR"

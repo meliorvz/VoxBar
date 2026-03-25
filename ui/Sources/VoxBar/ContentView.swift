@@ -136,6 +136,7 @@ struct ContentView: View {
                     inlineStatus
                 }
 
+                bufferingToggle
                 HStack {
                     Button("Clear") {
                         viewModel.inputText = ""
@@ -604,7 +605,7 @@ struct ContentView: View {
                     TransportButton(symbol: "gobackward.15", size: 42) {
                         viewModel.rewind()
                     }
-                    .disabled(!canControlPlayback)
+                    .disabled(!canControlPlayback || !playback.canSeek)
 
                     Button {
                         viewModel.togglePlayback()
@@ -619,7 +620,7 @@ struct ContentView: View {
                     TransportButton(symbol: "goforward.30", size: 42) {
                         viewModel.skipForward()
                     }
-                    .disabled(!canControlPlayback)
+                    .disabled(!canControlPlayback || !playback.canSeek)
                 }
 
                 Spacer()
@@ -637,6 +638,8 @@ struct ContentView: View {
                         )
                     )
                     .tint(accent)
+                    .disabled(!playback.canSeek)
+                    .opacity(playback.canSeek ? 1 : 0.72)
 
                     HStack {
                         Text(formattedTime(playback.currentTime))
@@ -645,6 +648,12 @@ struct ContentView: View {
                     }
                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(mutedInk)
+
+                    if !playback.canSeek && playback.isBufferingStream {
+                        Text("Seek unlocks when the final file is ready.")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(mutedInk)
+                    }
                 }
             }
         }
@@ -797,6 +806,40 @@ struct ContentView: View {
         return String(format: "%.2fx", value)
     }
 
+    private var bufferingToggle: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Play while Buffering")
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(ink)
+                Text("Start playback early once enough audio is safely buffered.")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(mutedInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 10)
+
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { viewModel.playWhileBufferingEnabled },
+                    set: { viewModel.setPlayWhileBufferingEnabled($0) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .tint(accent)
+            .disabled(viewModel.isGenerating)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.32))
+        )
+    }
+
     private var trimmedInput: String {
         viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -854,6 +897,9 @@ struct ContentView: View {
     }
 
     private var playerSubtitle: String {
+        if playback.isBufferingStream, let subtitle = playback.currentSubtitle {
+            return subtitle + " • Buffering"
+        }
         if let subtitle = playback.currentSubtitle {
             return subtitle
         }
@@ -874,7 +920,11 @@ struct ContentView: View {
         if trimmedInput.isEmpty {
             return "New from link or text"
         }
-        return sourceModeLabel + " • " + String(trimmedInput.prefix(42))
+        let preview = String(trimmedInput.prefix(42))
+        if viewModel.playWhileBufferingEnabled {
+            return sourceModeLabel + " • Buffer play on • " + preview
+        }
+        return sourceModeLabel + " • " + preview
     }
 
     private var recentSectionSubtitle: String {
