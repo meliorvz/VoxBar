@@ -367,37 +367,41 @@ struct ContentView: View {
                 .frame(maxWidth: 228, alignment: .trailing)
             }
 
-            if !filteredFavoriteSettings.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Starred")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(mutedInk)
-                        .textCase(.uppercase)
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if !filteredFavoriteSettings.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Starred")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(mutedInk)
+                                .textCase(.uppercase)
 
-                    LazyVStack(spacing: 6) {
-                        ForEach(filteredFavoriteSettings.prefix(ArticleTTSViewModel.maxFavoriteSettings)) { favorite in
-                            favoriteSettingRow(favorite)
+                            LazyVStack(spacing: 6) {
+                                ForEach(filteredFavoriteSettings.prefix(ArticleTTSViewModel.maxFavoriteSettings)) { favorite in
+                                    favoriteSettingRow(favorite)
+                                }
+                            }
+                        }
+                    }
+
+                    if filteredVoiceProfiles.isEmpty {
+                        emptyVoiceState
+                    } else {
+                        LazyVStack(spacing: 6) {
+                            ForEach(filteredVoiceProfiles, id: \.id) { profile in
+                                voiceRow(profile)
+                            }
                         }
                     }
                 }
+                .padding(.trailing, 4)
             }
-
-            if filteredVoiceProfiles.isEmpty {
-                emptyVoiceState
-            } else {
-                ScrollView(.vertical, showsIndicators: true) {
-                    LazyVStack(spacing: 6) {
-                        ForEach(filteredVoiceProfiles, id: \.id) { profile in
-                            voiceRow(profile)
-                        }
-                    }
-                    .padding(.trailing, 4)
-                }
-                .frame(width: 348, height: 248)
-            }
+            .frame(width: 348, height: 284, alignment: .topLeading)
         }
         .padding(12)
-        .frame(width: 372)
+        // Keep the popover size stable so filter changes do not trigger
+        // animated window resizing in NSPopover.
+        .frame(width: 372, height: 360, alignment: .topLeading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color(red: 0.97, green: 0.95, blue: 0.92).opacity(0.98))
@@ -511,9 +515,7 @@ struct ContentView: View {
         let isSelected = filter == selectedVoiceFilter
 
         return Button {
-            withAnimation(.spring(response: 0.24, dampingFraction: 0.92)) {
-                selectedVoiceFilter = filter
-            }
+            selectedVoiceFilter = filter
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: filter.symbolName)
@@ -543,9 +545,7 @@ struct ContentView: View {
                 .font(.system(size: 12.5, weight: .semibold))
                 .foregroundStyle(ink)
             Button("Clear Filter") {
-                withAnimation(.spring(response: 0.24, dampingFraction: 0.92)) {
-                    selectedVoiceFilter = .all
-                }
+                selectedVoiceFilter = .all
             }
             .buttonStyle(TextActionButtonStyle())
         }

@@ -15,6 +15,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
     private var filePlayer: AVAudioPlayer?
     private var streamPlayer: AVQueuePlayer?
     private var timer: Timer?
+    private var streamChunks: [BufferedChunk] = []
     private var streamChunkDurations: [ObjectIdentifier: TimeInterval] = [:]
     private var streamObserverTokens: [ObjectIdentifier: NSObjectProtocol] = [:]
     private var streamBufferedDuration: TimeInterval = 0
@@ -78,6 +79,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         duration = 0
         canSeek = false
         isBufferingStream = true
+        streamChunks = []
         streamBufferedDuration = 0
         streamConsumedDuration = 0
         streamStarted = false
@@ -96,22 +98,12 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             streamFirstChunkAt = Date()
         }
 
-        let item = AVPlayerItem(url: url)
-        let identifier = ObjectIdentifier(item)
-        streamChunkDurations[identifier] = chunkDuration
-        streamObserverTokens[identifier] = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self, weak item] _ in
-            guard let self, let item else { return }
-            Task { @MainActor in
-                self.handleStreamItemEnded(item)
-            }
-        }
-        streamPlayer.insert(item, after: nil)
+        let chunk = BufferedChunk(url: url, duration: chunkDuration)
+        streamChunks.append(chunk)
+        enqueueBufferedChunk(chunk, on: streamPlayer)
         streamBufferedDuration += chunkDuration
         duration = max(duration, streamBufferedDuration)
+        canSeek = true
         maybeStartOrResumeBufferedPlayback()
     }
 
@@ -198,6 +190,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         streamBufferedDuration = 0
         streamConsumedDuration = 0
+        streamChunks = []
         streamFirstChunkAt = nil
         streamStarted = false
         streamFinished = false
@@ -216,9 +209,13 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             return
         }
 
-        guard let finalStreamURL else { return }
-        let target = min(max(currentTime + delta, 0), duration)
-        switchBufferedPlaybackToFile(at: target, url: finalStreamURL)
+        if let finalStreamURL {
+            let target = min(max(currentTime + delta, 0), duration)
+            switchBufferedPlaybackToFile(at: target, url: finalStreamURL)
+            return
+        }
+
+        seekBufferedPlayback(to: currentTime + delta)
     }
 
     func seek(to fraction: Double) {
@@ -229,9 +226,13 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             return
         }
 
-        guard let finalStreamURL else { return }
-        let newTime = min(max(duration * fraction, 0), duration)
-        switchBufferedPlaybackToFile(at: newTime, url: finalStreamURL)
+        if let finalStreamURL {
+            let newTime = min(max(duration * fraction, 0), duration)
+            switchBufferedPlaybackToFile(at: newTime, url: finalStreamURL)
+            return
+        }
+
+        seekBufferedPlayback(to: duration * fraction)
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -268,6 +269,88 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
                 )
             }
         }
+    }
+
+    private func seekBufferedPlayback(to targetTime: TimeInterval) {
+        guard streamPlayer != nil, !streamChunks.isEmpty else { return }
+
+        let upperBound = max(streamBufferedDuration - 0.001, 0)
+        let clampedTarget = min(max(targetTime, 0), upperBound)
+        rebuildBufferedPlayback(at: clampedTarget, shouldResume: isPlaying)
+    }
+
+    private func rebuildBufferedPlayback(at targetTime: TimeInterval, shouldResume: Bool) {
+        guard let oldPlayer = streamPlayer else { return }
+
+        let anchor = bufferedChunkAnchor(for: targetTime)
+
+        oldPlayer.pause()
+        oldPlayer.removeAllItems()
+        clearStreamObservers()
+
+        let player = AVQueuePlayer()
+        player.actionAtItemEnd = .advance
+        streamPlayer = player
+        streamConsumedDuration = anchor.startTime
+        streamStarted = true
+        streamWaitingForBuffer = false
+        streamFinished = false
+        currentTime = targetTime
+        duration = max(duration, streamBufferedDuration)
+        canSeek = true
+        isBufferingStream = shouldResume ? false : isBufferingStream
+
+        for chunk in streamChunks[anchor.startIndex...] {
+            enqueueBufferedChunk(chunk, on: player)
+        }
+
+        if anchor.offset > 0 {
+            player.seek(
+                to: CMTime(seconds: anchor.offset, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
+
+        if shouldResume {
+            player.play()
+            isPlaying = true
+            isBufferingStream = false
+        } else {
+            isPlaying = false
+        }
+        startTimer()
+    }
+
+    private func bufferedChunkAnchor(for time: TimeInterval) -> (startIndex: Int, startTime: TimeInterval, offset: TimeInterval) {
+        var accumulated: TimeInterval = 0
+
+        for (index, chunk) in streamChunks.enumerated() {
+            let nextBoundary = accumulated + chunk.duration
+            if time < nextBoundary || index == streamChunks.count - 1 {
+                return (index, accumulated, max(time - accumulated, 0))
+            }
+            accumulated = nextBoundary
+        }
+
+        return (0, 0, 0)
+    }
+
+    private func enqueueBufferedChunk(_ chunk: BufferedChunk, on player: AVQueuePlayer) {
+        let item = AVPlayerItem(url: chunk.url)
+        let identifier = ObjectIdentifier(item)
+        streamChunkDurations[identifier] = chunk.duration
+        streamObserverTokens[identifier] = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            guard let self, let item else { return }
+            Task { @MainActor in
+                self.handleStreamItemEnded(item)
+            }
+        }
+        player.insert(item, after: nil)
     }
 
     private func maybeStartOrResumeBufferedPlayback(forceUserResume: Bool = false) {
@@ -447,4 +530,9 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         timer?.invalidate()
         timer = nil
     }
+}
+
+private struct BufferedChunk {
+    let url: URL
+    let duration: TimeInterval
 }
