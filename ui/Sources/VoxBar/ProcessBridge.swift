@@ -56,7 +56,7 @@ final class ProcessBridge {
                         metadata: [
                             "command": executableURL.path,
                             "exit_code": String(process.terminationStatus),
-                            "stderr": result.stderr.trimmingCharacters(in: .whitespacesAndNewlines),
+                            "error": result.userFacingErrorDescription,
                         ]
                     )
                     continuation.resume(throwing: BridgeError.processFailed(result))
@@ -128,11 +128,52 @@ enum BridgeError: LocalizedError {
         case .missingBridge(let url):
             return "Bridge script not found at \(url.path)"
         case .processFailed(let result):
-            return result.stderr.isEmpty
-                ? "Generation failed with exit code \(result.exitCode)."
-                : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            return result.userFacingErrorDescription
         case .malformedOutput(let message):
             return message
         }
+    }
+}
+
+private struct BridgeErrorPayload: Decodable {
+    let type: String
+    let message: String?
+}
+
+private extension CLIResult {
+    var userFacingErrorDescription: String {
+        let stderrText = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stderrText.isEmpty {
+            return stderrText
+        }
+
+        if let bridgeMessage = bridgeErrorMessage {
+            return bridgeMessage
+        }
+
+        let stdoutText = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let lastLine = stdoutText.split(whereSeparator: \.isNewline).last {
+            return String(lastLine)
+        }
+
+        return "Generation failed with exit code \(exitCode)."
+    }
+
+    private var bridgeErrorMessage: String? {
+        for line in stdout.split(whereSeparator: \.isNewline).reversed() {
+            guard let data = String(line).data(using: .utf8),
+                  let payload = try? JSONDecoder().decode(BridgeErrorPayload.self, from: data),
+                  payload.type == "error"
+            else {
+                continue
+            }
+
+            let message = payload.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !message.isEmpty {
+                return message
+            }
+        }
+
+        return nil
     }
 }
