@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import MediaPlayer
 import Foundation
 
 @MainActor
@@ -18,6 +19,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
     private var streamChunks: [BufferedChunk] = []
     private var streamChunkDurations: [ObjectIdentifier: TimeInterval] = [:]
     private var streamObserverTokens: [ObjectIdentifier: NSObjectProtocol] = [:]
+    private var remoteCommandTokens: [Any] = []
     private var streamBufferedDuration: TimeInterval = 0
     private var streamConsumedDuration: TimeInterval = 0
     private var streamFirstChunkAt: Date?
@@ -32,6 +34,11 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
     private let resumeBufferFloor: TimeInterval = 10
     private let lowBufferFloor: TimeInterval = 4
     private let startRateFloor: Double = 1.12
+
+    override init() {
+        super.init()
+        configureRemoteCommands()
+    }
 
     var isBufferedSessionActive: Bool {
         streamPlayer != nil
@@ -53,6 +60,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             isBufferingStream = false
             player.play()
             isPlaying = true
+            publishNowPlayingState()
             startTimer()
         } catch {
             playbackError = error.localizedDescription
@@ -88,6 +96,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         streamUserPaused = false
         streamFirstChunkAt = nil
         finalStreamURL = nil
+        publishNowPlayingState()
         startTimer()
         AppLogger.info("Buffered playback session prepared", metadata: ["title": title])
     }
@@ -104,6 +113,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         streamBufferedDuration += chunkDuration
         duration = max(duration, streamBufferedDuration)
         canSeek = true
+        publishNowPlayingState()
         maybeStartOrResumeBufferedPlayback()
     }
 
@@ -123,6 +133,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         }
 
         maybeStartOrResumeBufferedPlayback()
+        publishNowPlayingState()
         AppLogger.info(
             "Buffered playback finalized",
             metadata: [
@@ -145,9 +156,11 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             if filePlayer.isPlaying {
                 filePlayer.pause()
                 isPlaying = false
+                publishNowPlayingState()
             } else {
                 filePlayer.play()
                 isPlaying = true
+                publishNowPlayingState()
                 startTimer()
             }
             return
@@ -159,6 +172,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
                 streamUserPaused = true
                 isPlaying = false
                 isBufferingStream = false
+                publishNowPlayingState()
             } else {
                 streamUserPaused = false
                 maybeStartOrResumeBufferedPlayback(forceUserResume: true)
@@ -187,6 +201,8 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         playbackError = nil
         isBufferingStream = false
         canSeek = true
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
 
         streamBufferedDuration = 0
         streamConsumedDuration = 0
@@ -206,6 +222,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             let newTime = min(max(filePlayer.currentTime + delta, 0), filePlayer.duration)
             filePlayer.currentTime = newTime
             currentTime = newTime
+            publishNowPlayingState()
             return
         }
 
@@ -223,6 +240,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             let newTime = min(max(filePlayer.duration * fraction, 0), filePlayer.duration)
             filePlayer.currentTime = newTime
             currentTime = newTime
+            publishNowPlayingState()
             return
         }
 
@@ -239,6 +257,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         Task { @MainActor in
             isPlaying = false
             stopTimer()
+            publishNowPlayingState()
         }
     }
 
@@ -251,6 +270,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         streamConsumedDuration += chunkDuration
         currentTime = min(streamConsumedDuration, streamBufferedDuration)
+        publishNowPlayingState()
 
         guard let streamPlayer else { return }
         if streamPlayer.items().isEmpty {
@@ -319,6 +339,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         } else {
             isPlaying = false
         }
+        publishNowPlayingState()
         startTimer()
     }
 
@@ -370,6 +391,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
                 streamWaitingForBuffer = false
                 isPlaying = true
                 isBufferingStream = false
+                publishNowPlayingState()
                 AppLogger.info(
                     "Buffered playback started",
                     metadata: [
@@ -380,6 +402,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             } else {
                 isPlaying = false
                 isBufferingStream = true
+                publishNowPlayingState()
             }
             return
         }
@@ -389,6 +412,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             streamWaitingForBuffer = false
             isPlaying = true
             isBufferingStream = false
+            publishNowPlayingState()
             AppLogger.info(
                 "Buffered playback resumed",
                 metadata: [
@@ -399,6 +423,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             streamPlayer.play()
             isPlaying = true
             isBufferingStream = false
+            publishNowPlayingState()
         }
     }
 
@@ -442,6 +467,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
         currentTime = min(streamConsumedDuration + normalizedItemTime, max(duration, streamBufferedDuration))
         duration = max(duration, streamBufferedDuration)
         isPlaying = streamPlayer.rate > 0
+        publishNowPlayingState()
 
         let bufferedAhead = max(streamBufferedDuration - currentTime, 0)
         if streamStarted,
@@ -499,6 +525,7 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
             } else {
                 isPlaying = false
             }
+            publishNowPlayingState()
             AppLogger.info(
                 "Buffered playback switched to final file",
                 metadata: [
@@ -516,6 +543,124 @@ final class PlaybackController: NSObject, ObservableObject, AVAudioPlayerDelegat
                 ]
             )
         }
+    }
+
+    private func configureRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+
+        remoteCommandTokens.append(
+            center.playCommand.addTarget { [weak self] _ in
+                Task { @MainActor in
+                    self?.handleRemotePlay()
+                }
+                return .success
+            }
+        )
+
+        remoteCommandTokens.append(
+            center.pauseCommand.addTarget { [weak self] _ in
+                Task { @MainActor in
+                    self?.handleRemotePause()
+                }
+                return .success
+            }
+        )
+
+        remoteCommandTokens.append(
+            center.togglePlayPauseCommand.addTarget { [weak self] _ in
+                Task { @MainActor in
+                    self?.togglePlayPause()
+                }
+                return .success
+            }
+        )
+
+        center.skipBackwardCommand.preferredIntervals = [15]
+        remoteCommandTokens.append(
+            center.skipBackwardCommand.addTarget { [weak self] event in
+                guard let commandEvent = event as? MPSkipIntervalCommandEvent else { return .commandFailed }
+                Task { @MainActor in
+                    self?.seek(by: -commandEvent.interval)
+                }
+                return .success
+            }
+        )
+
+        center.skipForwardCommand.preferredIntervals = [30]
+        remoteCommandTokens.append(
+            center.skipForwardCommand.addTarget { [weak self] event in
+                guard let commandEvent = event as? MPSkipIntervalCommandEvent else { return .commandFailed }
+                Task { @MainActor in
+                    self?.seek(by: commandEvent.interval)
+                }
+                return .success
+            }
+        )
+
+        remoteCommandTokens.append(
+            center.changePlaybackPositionCommand.addTarget { [weak self] event in
+                guard let commandEvent = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+                Task { @MainActor in
+                    self?.seek(to: commandEvent.positionTime / max(self?.duration ?? 1, 1))
+                }
+                return .success
+            }
+        )
+    }
+
+    private func unregisterRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+        for token in remoteCommandTokens {
+            center.playCommand.removeTarget(token)
+            center.pauseCommand.removeTarget(token)
+            center.togglePlayPauseCommand.removeTarget(token)
+            center.skipBackwardCommand.removeTarget(token)
+            center.skipForwardCommand.removeTarget(token)
+            center.changePlaybackPositionCommand.removeTarget(token)
+        }
+        remoteCommandTokens.removeAll(keepingCapacity: false)
+    }
+
+    private func handleRemotePlay() {
+        if filePlayer != nil || streamPlayer != nil {
+            if !isPlaying {
+                togglePlayPause()
+            }
+        }
+    }
+
+    private func handleRemotePause() {
+        if filePlayer != nil || streamPlayer != nil {
+            if isPlaying {
+                togglePlayPause()
+            }
+        }
+    }
+
+    private func publishNowPlayingState() {
+        let center = MPNowPlayingInfoCenter.default()
+
+        guard let title = currentTitle else {
+            center.nowPlayingInfo = nil
+            center.playbackState = .stopped
+            return
+        }
+
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: title,
+            MPMediaItemPropertyArtist: currentSubtitle ?? "VoxBar",
+            MPMediaItemPropertyPlaybackDuration: duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+        ]
+
+        if let url = filePlayer?.url ?? finalStreamURL {
+            info[MPMediaItemPropertyAssetURL] = url
+        }
+
+        center.nowPlayingInfo = info
+        center.playbackState = isPlaying ? .playing : .paused
     }
 
     private func clearStreamObservers() {

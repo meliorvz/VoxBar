@@ -165,54 +165,62 @@ struct ContentView: View {
     }
 
     private var settingsSection: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 10) {
-                Button {
-                    withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
-                        isSettingsExpanded.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(accent)
-                            .frame(width: 20)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Voice & Speed")
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundStyle(mutedInk)
-                                .textCase(.uppercase)
-                            Text("\(selectedVoiceProfile.displayName) • \(viewModel.selectedSpeedLabel)")
-                                .font(.system(size: 13.5, weight: .medium))
-                                .foregroundStyle(ink.opacity(0.88))
-                                .lineLimit(1)
+        ZStack(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 10) {
+                    Button {
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                            isSettingsExpanded.toggle()
                         }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(accent)
+                                .frame(width: 20)
 
-                        Spacer(minLength: 8)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Voice & Speed")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(mutedInk)
+                                    .textCase(.uppercase)
+                                Text("\(selectedVoiceProfile.displayName) • \(viewModel.selectedSpeedLabel)")
+                                    .font(.system(size: 13.5, weight: .medium))
+                                    .foregroundStyle(ink.opacity(0.88))
+                                    .lineLimit(1)
+                            }
 
-                        Image(systemName: isSettingsExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(mutedInk)
+                            Spacer(minLength: 8)
+
+                            Image(systemName: isSettingsExpanded ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(mutedInk)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        viewModel.toggleFavoriteCurrentSetting()
+                    } label: {
+                        Image(systemName: viewModel.currentSettingIsFavorited ? "star.fill" : "star")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(UtilityIconButtonStyle())
+                }
+
+                if isSettingsExpanded {
+                    HStack(alignment: .top, spacing: 10) {
+                        voiceControl
+                        speedControl
                     }
                 }
-                .buttonStyle(.plain)
-
-                Button {
-                    viewModel.toggleFavoriteCurrentSetting()
-                } label: {
-                    Image(systemName: viewModel.currentSettingIsFavorited ? "star.fill" : "star")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 30, height: 30)
-                }
-                .buttonStyle(UtilityIconButtonStyle())
             }
 
-            if isSettingsExpanded {
-                HStack(alignment: .top, spacing: 10) {
-                    voiceControl
-                    speedControl
-                }
+            if showVoicePalette {
+                voicePalette
+                    .offset(y: 64)
+                    .zIndex(2)
             }
         }
         .padding(14)
@@ -336,9 +344,6 @@ struct ContentView: View {
             )
         }
         .buttonStyle(.plain)
-        .popover(isPresented: $showVoicePalette, arrowEdge: .top) {
-            voicePalette
-        }
     }
 
     private var voicePalette: some View {
