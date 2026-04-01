@@ -109,19 +109,26 @@ def apply_tech_subs(text: str) -> str:
 
 
 def split_compound_tokens(text: str) -> str:
-    """Split compound tokens (CamelCase, hyphens, underscores, quotes) before G2P."""
-    compound_pattern = (
-        r"^[''']+ |"
-        r"\p{Lu}(?=\p{Lu}\p{Ll}) |"
-        r"(?:\d?[,.]\d+)+ |"
-        r"[-_]+ |"
-        r"[''']{2,} |"
-        r"\p{L}*?(?:[''']\p{L})*?\p{Ll}(?=\p{Lu}) |"
-        r"\p{L}+(?:[''']\p{L})* |"
-        r"[^\p{L}'''\d]+ |"
-        r"[''']+$"
-    )
-    return re.sub(compound_pattern, " ", text)
+    """Split compound tokens (CamelCase, hyphens, underscores, quotes) before G2P.
+
+    Uses multiple separate re.sub passes instead of one combined alternation
+    pattern. This avoids Python's re alternation issue where a greedy
+    consuming pattern matches at position 0 and prevents zero-width boundary
+    assertions from firing at later positions.
+    """
+    # 1. Leading quotes
+    text = re.sub(r"^[''']+", " ", text)
+    # 2. Trailing quotes
+    text = re.sub(r"[''']+$", " ", text)
+    # 3. Internal apostrophes between word chars -> split
+    text = re.sub(r"(?<=[a-zA-Z])['''](?=[a-zA-Z])", " ", text)
+    # 4. Consecutive quote/punctuation runs -> single space
+    text = re.sub(r"[''']+", " ", text)
+    # 5. CamelCase boundaries: lowercase followed by uppercase
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+    # 6. Hyphens and underscores -> space
+    text = re.sub(r"[-_]+", " ", text)
+    return text
 
 
 VOCAB_VOWELS = frozenset("aeiou")
@@ -208,8 +215,9 @@ _voice_subs_cache: tuple[dict[str, str], dict[str, str]] | None = None
 def discover_voice_subs() -> Path | None:
     """Walk up from the current working directory to find a .voice-subs file."""
     cwd = Path.cwd()
-    for parent in cwd.parents:
-        voice_subs_path = parent / ".voice-subs"
+    # Check cwd itself first, then each parent
+    for directory in [cwd] + list(cwd.parents):
+        voice_subs_path = directory / ".voice-subs"
         if voice_subs_path.is_file():
             return voice_subs_path
     return None

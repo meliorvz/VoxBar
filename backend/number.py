@@ -47,7 +47,7 @@ def _cardinal_0_to_999(n: int) -> str:
 
 def cardinal(n: int) -> str:
     if n < 0:
-        return f"minus {_cardinal_0_to_999(-n)}"
+        return f"minus {cardinal(-n)}"
     if n == 0:
         return "zero"
     parts: list[str] = []
