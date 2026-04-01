@@ -85,6 +85,186 @@ class LanguageProfile:
     script_ranges: tuple[tuple[int, int], ...] = ()
 
 
+TECH_SUBS: dict[str, str] = {
+    "JSON": "jay-sahn",
+    "YAML": "yam-ul",
+    "TOML": "tom-ul",
+    "WASM": "waz-um",
+    "OAuth": "oh-auth",
+    "NGINX": "engine-X",
+    "PostgreSQL": "post-gres-Q-L",
+    "SQLite": "S-Q-lite",
+    "WiFi": "why-fye",
+    "iOS": "eye-O-S",
+    "macOS": "mac O S",
+    "VS Code": "V S Code",
+    "CRUD": "C-R-U-D",
+}
+
+
+def apply_tech_subs(text: str) -> str:
+    for term, replacement in TECH_SUBS.items():
+        text = text.replace(term, replacement)
+    return text
+
+
+def split_compound_tokens(text: str) -> str:
+    """Split compound tokens (CamelCase, hyphens, underscores, quotes) before G2P."""
+    compound_pattern = (
+        r"^[''']+ |"
+        r"\p{Lu}(?=\p{Lu}\p{Ll}) |"
+        r"(?:\d?[,.]\d+)+ |"
+        r"[-_]+ |"
+        r"[''']{2,} |"
+        r"\p{L}*?(?:[''']\p{L})*?\p{Ll}(?=\p{Lu}) |"
+        r"\p{L}+(?:[''']\p{L})* |"
+        r"[^\p{L}'''\d]+ |"
+        r"[''']+$"
+    )
+    return re.sub(compound_pattern, " ", text)
+
+
+VOCAB_VOWELS = frozenset("aeiou")
+
+CONTEXT_SENSITIVE_RULES: tuple[tuple[str, str, str], ...] = (
+    ("a", "eɪ", "ɐ"),
+    ("an", "ɐn", "ɐn"),
+    ("to", "tʊ", "tə"),
+    ("the", "ði", "ðə"),
+)
+
+
+def _get_next_word_first_char(
+    token_words: list[tuple[int, str]], current_index: int
+) -> str | None:
+    """Get the first alphabetic character of the next word, or None if not found."""
+    for i in range(current_index + 1, len(token_words)):
+        _, word = token_words[i]
+        for char in word:
+            if char.isalpha():
+                return char.lower()
+    return None
+
+
+def apply_context_sensitive_rules(text: str) -> str:
+    """Apply context-sensitive pronunciation rules to text.
+
+    Rules depend on the following word's first letter (vowel vs consonant).
+    Since Kokoro uses phonemes internally, IPA forms are injected directly.
+    Note: Kokoro may not support all IPA characters; integration may need
+    adjustment based on how Kokoro's phoneme input is handled.
+    """
+    word_pattern = re.compile(r"[\w']+")
+    tokens_with_spans: list[tuple[str, int, int]] = []
+    for match in word_pattern.finditer(text):
+        tokens_with_spans.append((match.group(), match.start(), match.end()))
+
+    if not tokens_with_spans:
+        return text
+
+    token_words: list[tuple[int, str]] = [
+        (start, word.lower()) for word, start, end in tokens_with_spans
+    ]
+
+    result_parts: list[str] = []
+    last_end = 0
+
+    for word, start, end in tokens_with_spans:
+        if start > last_end:
+            result_parts.append(text[last_end:start])
+
+        wi = None
+        for idx, (tok_start, _) in enumerate(token_words):
+            if tok_start == start:
+                wi = idx
+                break
+
+        if wi is not None:
+            lower_word = token_words[wi][1]
+            next_char = _get_next_word_first_char(token_words, wi)
+            next_starts_vowel = next_char in VOCAB_VOWELS if next_char else False
+
+            replacement = None
+            for target, before_vowel, before_cons in CONTEXT_SENSITIVE_RULES:
+                if lower_word == target:
+                    replacement = before_vowel if next_starts_vowel else before_cons
+                    break
+
+            result_parts.append(replacement if replacement is not None else word)
+        else:
+            result_parts.append(word)
+
+        last_end = end
+
+    if last_end < len(text):
+        result_parts.append(text[last_end:])
+
+    return "".join(result_parts)
+
+
+_voice_subs_cache: tuple[dict[str, str], dict[str, str]] | None = None
+
+
+def discover_voice_subs() -> Path | None:
+    """Walk up from the current working directory to find a .voice-subs file."""
+    cwd = Path.cwd()
+    for parent in cwd.parents:
+        voice_subs_path = parent / ".voice-subs"
+        if voice_subs_path.is_file():
+            return voice_subs_path
+    return None
+
+
+def parse_voice_subs(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Parse a .voice-subs file into text substitutions and phoneme overrides.
+
+    Returns (text_subs, phoneme_subs) where:
+    - text_subs: WORD=REPLACEMENT applied before G2P
+    - phoneme_subs: WORD=/PHONEMES/ applied directly into phoneme stream (preliminary)
+    """
+    text_subs: dict[str, str] = {}
+    phoneme_subs: dict[str, str] = {}
+    if not path.is_file():
+        return text_subs, phoneme_subs
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            continue
+        if value.startswith("/") and value.endswith("/"):
+            phoneme_subs[key] = value[1:-1]
+        else:
+            text_subs[key] = value
+    return text_subs, phoneme_subs
+
+
+def _get_voice_subs() -> tuple[dict[str, str], dict[str, str]]:
+    """Get cached voice subs or discover and cache them."""
+    global _voice_subs_cache
+    if _voice_subs_cache is None:
+        path = discover_voice_subs()
+        if path:
+            _voice_subs_cache = parse_voice_subs(path)
+        else:
+            _voice_subs_cache = {}, {}
+    return _voice_subs_cache
+
+
+def apply_voice_subs(text: str) -> str:
+    """Apply .voice-subs text substitutions before G2P."""
+    text_subs, _ = _get_voice_subs()
+    for word, replacement in text_subs.items():
+        pattern = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
+        text = pattern.sub(replacement, text)
+    return text
+
+
 LANGUAGE_PROFILES: tuple[LanguageProfile, ...] = (
     LanguageProfile(
         code="en-us",
@@ -370,7 +550,13 @@ def strip_markdown_for_tts(text: str) -> str:
 
 
 def clean_text(text: str) -> str:
+    import unicodedata
+    text = unicodedata.normalize('NFKC', text)
     text = strip_markdown_for_tts(text)
+    text = apply_tech_subs(text)
+    text = split_compound_tokens(text)
+    text = apply_context_sensitive_rules(text)
+    text = apply_voice_subs(text)
     lines: list[str] = []
     for raw_line in text.splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
@@ -391,6 +577,118 @@ def derive_title_from_text(text: str) -> str:
         if len(cleaned) >= 3:
             return cleaned[:80]
     return "pasted-text"
+
+
+# Morphological suffix decomposition helpers
+VOICED_CONSONANTS = frozenset("bdgjmnnrlw")
+VOICELESS_CONSONANTS = frozenset("ptkfsθ")
+
+
+def ends_with_double_consonant(word: str) -> bool:
+    """Check if word ends with a doubled consonant (e.g., 'run', 'sit')."""
+    if len(word) < 3:
+        return False
+    return word[-1] == word[-2] and word[-1] not in "aeiou"
+
+
+def ends_with_e_drops(word: str) -> bool:
+    """Check if word ends with consonant + e that drops before suffix (e.g., 'hope')."""
+    if len(word) < 2 or word[-1] != "e":
+        return False
+    if len(word) == 2:
+        return True
+    return word[-2] not in "aeiou"
+
+
+def apply_es_suffix(word: str) -> str:
+    """Apply -s/-es suffix, returning root + phonetic suffix."""
+    if word.endswith("ies"):
+        return word[:-3] + "+ᵻz"
+    if word.endswith("es"):
+        base = word[:-2]
+        if base.endswith(("ss", "xs", "zz", "ch", "sh")):
+            return base + "+ᵻz"
+        last = base[-1] if base else ""
+        if last in VOICELESS_CONSONANTS:
+            return base + "+s"
+        return base + "+z"
+    if word.endswith("s"):
+        base = word[:-1]
+        if base.endswith(("ss", "xs", "zz", "ch", "sh")):
+            return base + "+ᵻz"
+        last = base[-1] if base else ""
+        if last in VOICELESS_CONSONANTS:
+            return base + "+s"
+        return base + "+z"
+    last = word[-1] if word else ""
+    if last in VOICELESS_CONSONANTS:
+        return word + "+s"
+    return word + "+z"
+
+
+def apply_ed_suffix(word: str) -> str:
+    """Apply -ed suffix, returning root + phonetic suffix."""
+    if word.endswith("ed"):
+        base = word[:-2]
+        if not base:
+            return word + "+id"
+        if ends_with_e_drops(base + "e"):
+            return base + "+d"
+        if base[-1] in "dt":
+            return base + "+ᵻd"
+        if base[-1] in VOICED_CONSONANTS:
+            return base + "+d"
+        if base[-1] in VOICELESS_CONSONANTS:
+            return base + "+t"
+        return base + "+d"
+    return word + "+ed"
+
+
+def apply_ing_suffix(word: str) -> str:
+    """Apply -ing suffix, returning root + phonetic suffix."""
+    if word.endswith("ing"):
+        base = word[:-3]
+        if not base:
+            return word
+        if base.endswith("ck"):
+            return base[:-1] + "+cking"
+        if len(base) >= 2 and base[-1] == base[-2] and base[-1] not in "aeiou":
+            base = base[:-1]
+        elif len(base) >= 3:
+            third_last = base[-3]
+            is_vowel = third_last in "aeiou"
+            if is_vowel and base[-1] not in "aeiou" and base[-1] not in "wx":
+                base = base + base[-1]
+        return base + "+ing"
+    return word + "+ing"
+
+
+def morphological_decompose(word: str) -> str:
+    """Decompose a word into root + phonetic suffix for TTS fallback."""
+    if not word or len(word) < 3:
+        return word
+    lower = word.lower()
+    if lower.endswith("ing"):
+        return apply_ing_suffix(word)
+    if lower.endswith("ed"):
+        return apply_ed_suffix(word)
+    if lower.endswith("s") or lower.endswith("es"):
+        return apply_es_suffix(word)
+    return word
+
+
+def decompose_for_tts(text: str) -> str:
+    """Apply morphological decomposition to words in text for TTS OOV fallback."""
+    words = re.findall(r"[\w']+", text)
+    if not words:
+        return text
+    decomposed = text
+    for word in words:
+        if len(word) >= 3 and word == word.lower():
+            decomp = morphological_decompose(word)
+            if decomp != word:
+                decomposed = decomposed.replace(word, decomp, 1)
+    return decomposed
 
 
 def preview_prompt_for_voice(voice: str, phrase: str) -> str:
@@ -1168,7 +1466,11 @@ def synthesize(
             reporter.emit("progress", current=index, total=total, characters=len(chunk), stage="synthesizing")
         else:
             print(f"Chunk {index}/{total}", flush=True)
-        samples, current_rate = kokoro.create(chunk, voice=voice, speed=speed, lang=lang)
+        try:
+            samples, current_rate = kokoro.create(chunk, voice=voice, speed=speed, lang=lang)
+        except Exception:
+            decomposed_chunk = decompose_for_tts(chunk)
+            samples, current_rate = kokoro.create(decomposed_chunk, voice=voice, speed=speed, lang=lang)
         if sample_rate is None:
             sample_rate = current_rate
         elif current_rate != sample_rate:
